@@ -328,12 +328,19 @@ Agent swarm result:
 
 ## If `agent-swarm` is missing
 
-This skill is one git repo symlinked into place. The repo is the single source
-of truth; `~/.local/bin/agent-swarm` and both skill dirs are symlinks to it, so
-nothing drifts. To (re)install, run the repo's installer:
+When installed as a plugin, a SessionStart hook symlinks the bundled CLI
+(`skills/agent-swarm/scripts/agent-swarm`) to `~/.local/bin/agent-swarm`, so the
+bare `agent-swarm` commands in this skill just work — provided `~/.local/bin` is
+on your `PATH`.
+
+If the command is still not found:
 
 ```bash
-~/agent-swarm/install.sh
+# plugin install: re-run the bundled linker
+bash "${CLAUDE_PLUGIN_ROOT}/hooks/install-path.sh"
+
+# or, working from a clone of the repo:
+./install.sh
 ```
 
-Then make sure `~/.local/bin` is on your `PATH` and check with `agent-swarm doctor`.
+Then check with `agent-swarm doctor`.

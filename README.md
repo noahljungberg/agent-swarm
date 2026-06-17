@@ -1,25 +1,38 @@
 # agent-swarm
 
-A tiny tmux-based orchestration skill for Codex / Claude Code. The current AI
-session becomes an orchestrator that spawns separate Codex/Claude/Hermes worker
-agents in tmux, tracks them in a TSV registry, tails their logs, sends them
-input, and reviews their output. No daemon, no database — just bash, tmux, and
-files under `~/.agent-swarm/`.
+A tmux-based orchestration skill for Codex / Claude Code. The current AI session
+becomes an orchestrator that spawns separate Codex/Claude/Hermes worker agents in
+tmux, tracks them in a TSV registry, tails their logs, sends them input, and
+reviews their output. No daemon, no database — just bash, tmux, and files under
+`~/.agent-swarm/`.
+
+This repo is both a Claude Code **plugin** and a single-plugin **marketplace**.
 
 ## Install
 
-```bash
-git clone <this-repo> ~/agent-swarm
-~/agent-swarm/install.sh
-agent-swarm doctor
+**Claude Code**
+
+```
+/plugin marketplace add <GH_USER>/agent-swarm
+/plugin install agent-swarm@agent-swarm
 ```
 
-`install.sh` symlinks:
+**Codex**
 
-- `scripts/agent-swarm` → `~/.local/bin/agent-swarm` (CLI on PATH)
-- this repo → `~/.codex/skills/agent-swarm` and `~/.claude/skills/agent-swarm`
+```
+codex plugin marketplace add <GH_USER>/agent-swarm
+codex
+```
 
-One source of truth; the consumers are symlinks, so nothing drifts.
+A SessionStart hook symlinks the bundled CLI to `~/.local/bin/agent-swarm`, so
+make sure `~/.local/bin` is on your `PATH`. Verify with `agent-swarm doctor`.
+
+**Manual (no marketplace)**
+
+```bash
+git clone https://github.com/<GH_USER>/agent-swarm ~/agent-swarm
+~/agent-swarm/install.sh
+```
 
 ## Use
 
@@ -32,9 +45,21 @@ agent-swarm stop api-tests
 agent-swarm rm api-tests
 ```
 
-Engines: `codex` (default), `claude`, `hermes`, `shell`. Full workflow and
-safety rules are in `SKILL.md`.
+Engines: `codex` (default), `claude`, `hermes`, `shell`. Full orchestration
+workflow and safety rules are in `skills/agent-swarm/SKILL.md`.
 
 ## Requirements
 
 `tmux` (required); `codex` / `claude` / `hermes` as needed for those engines.
+
+## Layout
+
+```
+.claude-plugin/   marketplace.json + plugin.json (Claude Code)
+.codex-plugin/    plugin.json (Codex)
+hooks/            SessionStart hook that puts the CLI on PATH
+skills/agent-swarm/
+  SKILL.md        orchestration workflow
+  scripts/agent-swarm   the CLI
+  agents/openai.yaml    Codex agent interface
+```

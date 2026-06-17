@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-swarm",
+  "description": "Turn the current Codex/Claude session into an orchestrator that spawns and tracks tmux-backed worker agents.",
+  "owner": {
+    "name": "Noah Ljungberg",
+    "url": "https://github.com/<GH_USER>"
+  },
+  "plugins": [
+    {
+      "name": "agent-swarm",
+      "description": "Orchestrate Codex/Claude/Hermes worker agents in tmux: spawn, track, monitor, send input, review.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
