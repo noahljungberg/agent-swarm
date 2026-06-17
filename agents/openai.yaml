@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Swarm"
+  short_description: "Spawn and track Codex/Claude/Hermes worker agents"
+  default_prompt: "Use $agent-swarm. Act as the orchestrator: split the task into bounded worker prompts, spawn workers with agent-swarm where useful, monitor them, review outputs, and report running/completed/blocked agents plus required user action."
