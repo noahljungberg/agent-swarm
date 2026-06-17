@@ -4,10 +4,10 @@
   "description": "Orchestration skill: make the current session a controller that spawns Codex/Claude/Hermes worker agents in tmux, tracks them in a TSV registry, tails logs, sends input, and reviews output.",
   "author": {
     "name": "Noah Ljungberg",
-    "url": "https://github.com/<GH_USER>"
+    "url": "https://github.com/noahljungberg"
   },
-  "homepage": "https://github.com/<GH_USER>/agent-swarm",
-  "repository": "https://github.com/<GH_USER>/agent-swarm",
+  "homepage": "https://github.com/noahljungberg/agent-swarm",
+  "repository": "https://github.com/noahljungberg/agent-swarm",
   "license": "MIT",
   "keywords": ["orchestration", "agents", "tmux", "codex", "claude"],
   "skills": "./skills/",
@@ -18,7 +18,7 @@
     "developerName": "Noah Ljungberg",
     "category": "Productivity",
     "capabilities": ["Instructions", "Lifecycle hooks"],
-    "websiteURL": "https://github.com/<GH_USER>/agent-swarm",
+    "websiteURL": "https://github.com/noahljungberg/agent-swarm",
     "defaultPrompt": [
       "Use agent-swarm. Act as the orchestrator: split the task into bounded worker prompts, spawn workers, monitor them, review outputs, and report running/completed/blocked agents plus required user action."
     ]

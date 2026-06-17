@@ -13,14 +13,14 @@ This repo is both a Claude Code **plugin** and a single-plugin **marketplace**.
 **Claude Code**
 
 ```
-/plugin marketplace add <GH_USER>/agent-swarm
+/plugin marketplace add noahljungberg/agent-swarm
 /plugin install agent-swarm@agent-swarm
 ```
 
 **Codex**
 
 ```
-codex plugin marketplace add <GH_USER>/agent-swarm
+codex plugin marketplace add noahljungberg/agent-swarm
 codex
 ```
 
@@ -30,7 +30,7 @@ make sure `~/.local/bin` is on your `PATH`. Verify with `agent-swarm doctor`.
 **Manual (no marketplace)**
 
 ```bash
-git clone https://github.com/<GH_USER>/agent-swarm ~/agent-swarm
+git clone https://github.com/noahljungberg/agent-swarm ~/agent-swarm
 ~/agent-swarm/install.sh
 ```
 

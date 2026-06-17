@@ -4,7 +4,7 @@
   "description": "Turn the current Codex/Claude session into an orchestrator that spawns and tracks tmux-backed worker agents.",
   "owner": {
     "name": "Noah Ljungberg",
-    "url": "https://github.com/<GH_USER>"
+    "url": "https://github.com/noahljungberg"
   },
   "plugins": [
     {
