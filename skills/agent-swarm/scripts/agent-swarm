@@ -20,9 +20,11 @@ Usage:
   agent-swarm status <id-or-name>
   agent-swarm log <id-or-name> [lines]
   agent-swarm send <id-or-name> <text>
+  agent-swarm assign <id-or-name> -- <task text>
   agent-swarm stop <id-or-name>
   agent-swarm rm <id-or-name>
   agent-swarm doctor
+  agent-swarm selftest
 
 Spawn options:
   --name NAME             Human-friendly name (default: auto)
@@ -32,18 +34,34 @@ Spawn options:
   --prompt TEXT           Prompt text
   --prompt-file FILE      Read prompt from file
   --cmd COMMAND           For --engine shell only: shell command to run
+  --model NAME            Codex model id (e.g. gpt-5.5); reused on resume
+  --reasoning EFFORT      Codex reasoning effort (minimal|low|medium|high|xhigh)
   --no-full-auto          Codex exec without --full-auto
   --yolo                  Codex exec with --yolo instead of --full-auto
   --dangerous             Claude interactive with --dangerously-skip-permissions
   --max-turns N           Claude print-mode max turns (default: 30)
   --detach-only           Create tracker + tmux session, do not wait (default)
 
+Persistent employees:
+  A spawned worker is an employee, not a one-shot job. `stop` sends it home but
+  keeps its registry row and conversation id; `assign` calls it back with new
+  work, resuming its prior context; `rm` forgets it.
+
+  agent-swarm assign <id-or-name> -- <task text>
+  agent-swarm assign <id-or-name> --prompt-file FILE
+
+  If the worker is a live interactive session, the task is typed in. Otherwise
+  the worker is relaunched resuming its stored conversation (Claude --resume /
+  Codex `exec resume`) in the same cwd, so it remembers what it did before.
+
 Examples:
   agent-swarm spawn --name api-tests --engine codex --cwd ~/repo -- 'Add tests for auth service. Commit when done.'
+  agent-swarm spawn --name coder --engine codex --model gpt-5.5 --reasoning xhigh --cwd ~/repo -- 'Implement feature X.'
   agent-swarm spawn --name review --engine claude --cwd ~/repo -- 'Review this repo for security issues.'
   agent-swarm list
   agent-swarm log api-tests 120
   agent-swarm send api-tests 'Yes, proceed with option A.'
+  agent-swarm assign coder -- 'Address the review comments and re-run the tests.'
   agent-swarm stop api-tests
 EOF
 }
@@ -51,6 +69,7 @@ EOF
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-' | sed 's/^-//;s/-$//;s/^$/agent/'; }
 new_id() { printf '%s-%04d' "$(date -u +%Y%m%d%H%M%S)" "$(( RANDOM % 10000 ))"; }
+gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || printf 'sid-%s-%04d' "$(date -u +%s)" "$(( RANDOM % 10000 ))"; }
 
 # Guard a `--flag value` option: call as `need_val "$@"` so $1 is the flag and
 # the remaining count tells us whether a value follows. Avoids the raw bash
@@ -84,6 +103,17 @@ resolve_ref() {
 field() {
   local id="$1" n="$2"
   awk -F '\t' -v id="$id" -v n="$n" '$1 == id {print $n; exit}' "$STATE_FILE"
+}
+
+# The persistent conversation id for an agent. Prefer the registry column
+# (field 13, set when we choose the id ourselves, e.g. Claude --session-id);
+# fall back to the per-agent session_id file the runner writes for engines whose
+# id is only known after launch (e.g. Codex rollouts).
+session_id_of() {
+  local id="$1" v
+  v=$(field "$id" 13)
+  if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+  if [[ -f "$RUN_DIR/$id/session_id" ]]; then tr -d '\n' < "$RUN_DIR/$id/session_id"; fi
 }
 
 tmux_alive() {
@@ -120,17 +150,124 @@ rewrite_status() {
   mv "$tmp" "$STATE_FILE"
 }
 
+# Point an agent's registry row at a fresh tmux session and mark it running.
+# Used when resurrecting a stopped/exited employee under a new session name.
+set_session_running() {
+  local id="$1" session="$2" tmp
+  tmp=$(mktemp "$SWARM_HOME/.agents.XXXXXX")
+  awk -F '\t' -v OFS='\t' -v id="$id" -v s="$session" -v updated="$(now_iso)" \
+    '$1 == id {$6=s; $7="running"; $9=updated} {print}' "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
 append_agent() {
-  local id="$1" name="$2" engine="$3" cwd="$4" mode="$5" session="$6" status="$7" created="$8" updated="$9" prompt_file="${10}" log_file="${11}" command="${12}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$id" "$name" "$engine" "$cwd" "$mode" "$session" "$status" "$created" "$updated" "$prompt_file" "$log_file" "$command" >> "$STATE_FILE"
+  local id="$1" name="$2" engine="$3" cwd="$4" mode="$5" session="$6" status="$7" created="$8" updated="$9" prompt_file="${10}" log_file="${11}" command="${12}" session_id="${13:-}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$id" "$name" "$engine" "$cwd" "$mode" "$session" "$status" "$created" "$updated" "$prompt_file" "$log_file" "$command" "$session_id" >> "$STATE_FILE"
+}
+
+# Emit a runner script for tmux. `capture_codex=1` appends logic that records the
+# Codex rollout id so the worker can later be resumed. `cmdline` must contain a
+# literal "$PROMPT" (it is expanded inside the runner at run time).
+build_runner() {
+  local runner="$1" log_file="$2" exit_file="$3" cwd="$4" prompt_file="$5" sid_file="$6" capture_codex="$7" cmdline="$8"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -uo pipefail'
+    printf 'LOG_FILE=%q\n' "$log_file"
+    printf 'EXIT_FILE=%q\n' "$exit_file"
+    printf 'SID_FILE=%q\n' "$sid_file"
+    echo ': >>"$LOG_FILE"'
+    echo 'exec > >(tee -a "$LOG_FILE") 2>&1'
+    echo 'echo "__AGENT_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+    # Write the exit code straight to EXIT_FILE (and the sentinel straight to the
+    # log) from the trap so terminal status survives even if `tee` was killed.
+    echo 'trap '\''rc=$?; printf "%s\n" "$rc" >"$EXIT_FILE"; { echo "__AGENT_EXIT_CODE=$rc"; echo "__AGENT_ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } >>"$LOG_FILE"; exit $rc'\'' EXIT'
+    printf 'cd %q\n' "$cwd"
+    printf 'PROMPT_FILE=%q\n' "$prompt_file"
+    echo 'PROMPT="$(<"$PROMPT_FILE")"'
+    if [[ "$capture_codex" == 1 ]]; then echo '__mark="$(mktemp)"'; fi
+    printf '%s\n' "$cmdline"
+    if [[ "$capture_codex" == 1 ]]; then
+      cat <<'CAP'
+# ponytail: capture the Codex session id from the rollout written during this run
+# so the worker can be resumed later. UUID-from-rollout heuristic — verify the
+# rollout path/format against your codex version; if it changes, fix this block.
+CODEX_SESSIONS="${CODEX_HOME:-$HOME/.codex}/sessions"
+__newest="$(find "$CODEX_SESSIONS" -name '*.jsonl' -newer "$__mark" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)"
+if [ -n "$__newest" ]; then
+  __sid="$(basename "$__newest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n1)"
+  [ -z "$__sid" ] && __sid="$(grep -ohE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$__newest" 2>/dev/null | head -n1)"
+  [ -n "$__sid" ] && printf '%s\n' "$__sid" >"$SID_FILE"
+fi
+CAP
+    fi
+  } > "$runner"
+  chmod +x "$runner"
+}
+
+# Build the engine command line for spawn/assign. Sets the global `CMDLINE`,
+# `COMMAND_TEXT`, and `CAPTURE_CODEX`. `$PROMPT` is kept literal for the runner.
+build_cmdline() {
+  local engine="$1" mode="$2" resume_sid="$3" codex_auto="$4" codex_flags="$5" \
+        claude_danger="$6" max_turns="$7" session_id="$8" shell_cmd="$9"
+  CAPTURE_CODEX=0
+  case "$engine:$mode" in
+    codex:*)
+      if [[ -n "$resume_sid" ]]; then
+        # ponytail: `codex exec resume <id>` is the documented resume path — verify on your codex.
+        CMDLINE="codex exec resume $resume_sid${codex_flags:+ $codex_flags} \"\$PROMPT\""
+        COMMAND_TEXT="codex exec resume $resume_sid $codex_flags <prompt>"
+      elif [[ "$mode" == interactive ]]; then
+        CMDLINE="codex${codex_flags:+ $codex_flags} \"\$PROMPT\""
+        COMMAND_TEXT="codex $codex_flags <prompt>"
+        CAPTURE_CODEX=1
+      else
+        CMDLINE="codex exec${codex_auto:+ $codex_auto}${codex_flags:+ $codex_flags} \"\$PROMPT\""
+        COMMAND_TEXT="codex exec $codex_auto $codex_flags <prompt>"
+        CAPTURE_CODEX=1
+      fi
+      ;;
+    claude:interactive)
+      if [[ -n "$resume_sid" ]]; then
+        CMDLINE="claude --resume $resume_sid${claude_danger:+ $claude_danger} \"\$PROMPT\""
+        COMMAND_TEXT="claude --resume $resume_sid <prompt>"
+      else
+        CMDLINE="claude --session-id $session_id${claude_danger:+ $claude_danger} \"\$PROMPT\""
+        COMMAND_TEXT="claude --session-id $session_id $claude_danger <prompt>"
+      fi
+      ;;
+    claude:*)
+      if [[ -n "$resume_sid" ]]; then
+        CMDLINE="claude -p --resume $resume_sid --max-turns $max_turns \"\$PROMPT\""
+        COMMAND_TEXT="claude -p --resume $resume_sid --max-turns $max_turns <prompt>"
+      else
+        CMDLINE="claude -p --session-id $session_id --max-turns $max_turns \"\$PROMPT\""
+        COMMAND_TEXT="claude -p --session-id $session_id --max-turns $max_turns <prompt>"
+      fi
+      ;;
+    hermes:*)
+      CMDLINE="hermes chat -q \"\$PROMPT\""
+      COMMAND_TEXT="hermes chat -q <prompt>"
+      ;;
+    shell:*)
+      if [[ -z "$shell_cmd" ]]; then
+        CMDLINE='echo "ERROR: --engine shell requires --cmd"; exit 2'
+        COMMAND_TEXT="shell: (missing --cmd)"
+      else
+        CMDLINE="$shell_cmd"
+        COMMAND_TEXT="shell: $shell_cmd"
+      fi
+      ;;
+    *) echo "ERROR: cannot build command for $engine:$mode" >&2; exit 1 ;;
+  esac
 }
 
 cmd_spawn() {
   require_tmux
 
   local name="" engine="codex" cwd="$PWD" mode="exec" prompt="" prompt_file="" shell_cmd=""
-  local codex_auto="--full-auto" claude_danger="" max_turns="30"
+  local codex_auto="--full-auto" claude_danger="" max_turns="30" model="" reasoning=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -141,6 +278,8 @@ cmd_spawn() {
       --prompt) need_val "$@"; prompt="$2"; shift 2 ;;
       --prompt-file) need_val "$@"; prompt_file="$2"; shift 2 ;;
       --cmd) need_val "$@"; shell_cmd="$2"; shift 2 ;;
+      --model) need_val "$@"; model="$2"; shift 2 ;;
+      --reasoning) need_val "$@"; reasoning="$2"; shift 2 ;;
       --no-full-auto) codex_auto=""; shift ;;
       --yolo) codex_auto="--yolo"; shift ;;
       --dangerous) claude_danger="--dangerously-skip-permissions"; shift ;;
@@ -156,7 +295,7 @@ cmd_spawn() {
   case "$mode" in exec|interactive) ;; *) echo "ERROR: unsupported mode: $mode" >&2; exit 1 ;; esac
 
   cwd="$(cd "$cwd" && pwd)"
-  local id created updated safe_name session agent_dir log_file runner command_text
+  local id created updated safe_name session agent_dir log_file runner exit_file sid_file
   id="$(new_id)"
   name="${name:-$engine-$id}"
   safe_name="$(slugify "$name")"
@@ -166,6 +305,9 @@ cmd_spawn() {
   created="$(now_iso)"
   updated="$created"
   log_file="$LOG_DIR/$id-$safe_name.log"
+  runner="$agent_dir/run.sh"
+  exit_file="$agent_dir/exit_code"
+  sid_file="$agent_dir/session_id"
 
   if [[ -n "$prompt_file" ]]; then
     prompt_file="$(cd "$(dirname "$prompt_file")" && pwd)/$(basename "$prompt_file")"
@@ -174,67 +316,22 @@ cmd_spawn() {
     printf '%s\n' "$prompt" > "$prompt_file"
   fi
 
-  runner="$agent_dir/run.sh"
-  local exit_file="$agent_dir/exit_code"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'set -uo pipefail'
-    printf 'LOG_FILE=%q\n' "$log_file"
-    printf 'EXIT_FILE=%q\n' "$exit_file"
-    echo ': >>"$LOG_FILE"'
-    echo 'exec > >(tee -a "$LOG_FILE") 2>&1'
-    echo 'echo "__AGENT_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
-    # Write the exit code straight to EXIT_FILE (and the sentinel straight to the
-    # log) from the trap so terminal status survives even if `tee` was killed.
-    echo 'trap '\''rc=$?; printf "%s\n" "$rc" >"$EXIT_FILE"; { echo "__AGENT_EXIT_CODE=$rc"; echo "__AGENT_ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } >>"$LOG_FILE"; exit $rc'\'' EXIT'
-    printf 'cd %q\n' "$cwd"
-    printf 'PROMPT_FILE=%q\n' "$prompt_file"
-    echo 'PROMPT="$(<"$PROMPT_FILE")"'
-    case "$engine:$mode" in
-      codex:exec)
-        if [[ -n "$codex_auto" ]]; then
-          printf 'codex exec %s "$PROMPT"\n' "$codex_auto"
-          command_text="codex exec $codex_auto <prompt>"
-        else
-          echo 'codex exec "$PROMPT"'
-          command_text="codex exec <prompt>"
-        fi
-        ;;
-      codex:interactive)
-        echo 'codex "$PROMPT"'
-        command_text="codex <prompt>"
-        ;;
-      claude:exec)
-        printf 'claude -p "$PROMPT" --max-turns %q\n' "$max_turns"
-        command_text="claude -p <prompt> --max-turns $max_turns"
-        ;;
-      claude:interactive)
-        if [[ -n "$claude_danger" ]]; then
-          echo 'claude --dangerously-skip-permissions "$PROMPT"'
-          command_text="claude --dangerously-skip-permissions <prompt>"
-        else
-          echo 'claude "$PROMPT"'
-          command_text="claude <prompt>"
-        fi
-        ;;
-      hermes:exec)
-        echo 'hermes chat -q "$PROMPT"'
-        command_text="hermes chat -q <prompt>"
-        ;;
-      hermes:interactive)
-        echo 'hermes chat -q "$PROMPT"'
-        command_text="hermes interactive unavailable here; used one-shot"
-        ;;
-      shell:*)
-        if [[ -z "$shell_cmd" ]]; then echo 'echo "ERROR: --engine shell requires --cmd"; exit 2'; else printf '%s\n' "$shell_cmd"; fi
-        command_text="shell: $shell_cmd"
-        ;;
-    esac
-  } > "$runner"
-  chmod +x "$runner"
+  # Codex model/reasoning flags, persisted so resurrection reuses them.
+  local codex_flags=""
+  [[ -n "$model" ]] && codex_flags+=" -m $model"
+  [[ -n "$reasoning" ]] && codex_flags+=" -c model_reasoning_effort=$reasoning"
+  codex_flags="${codex_flags# }"
+  [[ "$engine" == codex ]] && printf '%s\n' "$codex_flags" > "$agent_dir/codex_flags"
+
+  # Claude lets us choose the conversation id up front; store it so we can resume.
+  local session_id=""
+  [[ "$engine" == claude ]] && session_id="$(gen_uuid)"
+
+  build_cmdline "$engine" "$mode" "" "$codex_auto" "$codex_flags" "$claude_danger" "$max_turns" "$session_id" "$shell_cmd"
+  build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_file" "$sid_file" "$CAPTURE_CODEX" "$CMDLINE"
 
   tmux new-session -d -s "$session" -x 140 -y 40 "$runner"
-  append_agent "$id" "$name" "$engine" "$cwd" "$mode" "$session" "running" "$created" "$updated" "$prompt_file" "$log_file" "$command_text"
+  append_agent "$id" "$name" "$engine" "$cwd" "$mode" "$session" "running" "$created" "$updated" "$prompt_file" "$log_file" "$COMMAND_TEXT" "$session_id"
 
   echo "spawned"
   echo "  id:      $id"
@@ -245,6 +342,72 @@ cmd_spawn() {
   echo "  cwd:     $cwd"
   echo "  prompt:  $prompt_file"
   echo "  log:     $log_file"
+  [[ -n "$session_id" ]] && echo "  sid:     $session_id"
+}
+
+# Reuse a worker for a new task, keeping its context. Live interactive session:
+# type the task in. Otherwise: relaunch resuming its stored conversation.
+cmd_assign() {
+  require_tmux
+  local ref="$1"; shift
+  local id; id=$(resolve_ref "$ref")
+
+  local prompt="" prompt_file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prompt) need_val "$@"; prompt="$2"; shift 2 ;;
+      --prompt-file) need_val "$@"; prompt_file="$2"; shift 2 ;;
+      --) shift; prompt="${prompt:-$*}"; break ;;
+      *) prompt="${prompt:-$*}"; break ;;
+    esac
+  done
+
+  local engine mode cwd session
+  engine=$(field "$id" 3); cwd=$(field "$id" 4); mode=$(field "$id" 5); session=$(field "$id" 6)
+
+  # Live interactive worker: just hand it the task (same as `send`).
+  if [[ "$mode" == interactive ]] && tmux_alive "$session"; then
+    if [[ -n "$prompt_file" ]]; then prompt="$(<"$prompt_file")"; fi
+    tmux send-keys -t "$session" -l -- "$prompt"
+    tmux send-keys -t "$session" Enter
+    rewrite_status "$id" "running"
+    echo "assigned to live $id ($session)"
+    return 0
+  fi
+
+  # Otherwise resurrect by resuming the stored conversation. Only Codex/Claude
+  # carry a resumable conversation; shell/hermes workers are one-shot.
+  case "$engine" in
+    codex|claude) ;;
+    *) echo "ERROR: cannot resume a $engine worker; spawn a new one" >&2; exit 1 ;;
+  esac
+  local agent_dir="$RUN_DIR/$id" log_file runner exit_file sid_file new_session safe_name prompt_path sid codex_flags=""
+  agent_dir="$RUN_DIR/$id"
+  mkdir -p "$agent_dir"
+  log_file=$(field "$id" 11); [[ -z "$log_file" ]] && log_file="$LOG_DIR/$id.log"
+  runner="$agent_dir/run.sh"; exit_file="$agent_dir/exit_code"; sid_file="$agent_dir/session_id"
+  safe_name="$(slugify "$(field "$id" 2)")"
+  new_session="agent-${safe_name}-$(printf '%04d' $((RANDOM % 10000)))"
+  sid="$(session_id_of "$id")"
+  [[ -f "$agent_dir/codex_flags" ]] && codex_flags="$(<"$agent_dir/codex_flags")"
+
+  if [[ -n "$prompt_file" ]]; then
+    prompt_path="$(cd "$(dirname "$prompt_file")" && pwd)/$(basename "$prompt_file")"
+  else
+    prompt_path=$(field "$id" 10); [[ -z "$prompt_path" ]] && prompt_path="$PROMPT_DIR/$id-assign.md"
+    printf '%s\n' "$prompt" > "$prompt_path"
+  fi
+  rm -f "$exit_file"
+
+  if [[ -z "$sid" ]]; then
+    echo "WARN: no session id stored for $id; starting fresh (prior context not restored)" >&2
+  fi
+  build_cmdline "$engine" "$mode" "$sid" "--full-auto" "$codex_flags" "" "30" "" ""
+  build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_path" "$sid_file" "$CAPTURE_CODEX" "$CMDLINE"
+
+  tmux new-session -d -s "$new_session" -x 140 -y 40 "$runner"
+  set_session_running "$id" "$new_session"
+  echo "assigned $id (resumed as $new_session, sid: ${sid:-none})"
 }
 
 cmd_list() {
@@ -265,18 +428,19 @@ cmd_status() {
   id=$(resolve_ref "$1")
   status=$(agent_runtime_status "$id")
   rewrite_status "$id" "$status"
-  echo "id:        $id"
-  echo "name:      $(field "$id" 2)"
-  echo "engine:    $(field "$id" 3)"
-  echo "cwd:       $(field "$id" 4)"
-  echo "mode:      $(field "$id" 5)"
-  echo "tmux:      $(field "$id" 6)"
-  echo "status:    $status"
-  echo "created:   $(field "$id" 8)"
-  echo "updated:   $(field "$id" 9)"
-  echo "prompt:    $(field "$id" 10)"
-  echo "log:       $(field "$id" 11)"
-  echo "command:   $(field "$id" 12)"
+  echo "id:         $id"
+  echo "name:       $(field "$id" 2)"
+  echo "engine:     $(field "$id" 3)"
+  echo "cwd:        $(field "$id" 4)"
+  echo "mode:       $(field "$id" 5)"
+  echo "tmux:       $(field "$id" 6)"
+  echo "status:     $status"
+  echo "created:    $(field "$id" 8)"
+  echo "updated:    $(field "$id" 9)"
+  echo "prompt:     $(field "$id" 10)"
+  echo "log:        $(field "$id" 11)"
+  echo "command:    $(field "$id" 12)"
+  echo "session_id: $(session_id_of "$id")"
 }
 
 cmd_log() {
@@ -350,6 +514,40 @@ cmd_doctor() {
   echo "tracked agents:   $(wc -l < "$STATE_FILE" | tr -d ' ')"
 }
 
+# Self-check: runs the tool against a throwaway home with no tmux/engines needed.
+# Verifies the 13-field schema, legacy 12-field rows, session_id_of, and that
+# `assign` on a dead agent builds a runner that resumes the stored id.
+cmd_selftest() {
+  local home; home="$(mktemp -d)"
+  local self="$0" fail=0
+  local sf="$home/agents.tsv"
+  mkdir -p "$home/runs/AID2"
+
+  # legacy 12-field row (no session_id column)
+  printf 'AID1\tlegacy\tcodex\t/tmp\texec\tsess-legacy\tstopped\t2026-01-01T00:00:00Z\t2026-01-01T00:00:00Z\t\t\tcodex exec <prompt>\n' > "$sf"
+  # new 13-field row with a Claude session id
+  printf 'AID2\temp\tclaude\t/tmp\texec\tsess-x\tstopped\t2026-01-01T00:00:00Z\t2026-01-01T00:00:00Z\t%s/p.md\t%s/l.log\tclaude\tabc-123-uuid\n' "$home" "$home" >> "$sf"
+
+  AGENT_SWARM_HOME="$home" "$self" list >/dev/null   || { echo "FAIL: list on mixed registry"; fail=1; }
+  AGENT_SWARM_HOME="$home" "$self" status legacy >/dev/null || { echo "FAIL: status on legacy row"; fail=1; }
+
+  local sid
+  sid=$(AGENT_SWARM_HOME="$home" "$self" status emp | awk -F': *' '/^session_id:/{print $2}')
+  [[ "$sid" == "abc-123-uuid" ]] || { echo "FAIL: session_id_of emp = '$sid' (want abc-123-uuid)"; fail=1; }
+
+  # assign on a dead claude agent must build a runner that resumes the stored id.
+  # Stub tmux so require_tmux/new-session succeed without a real server.
+  mkdir -p "$home/bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$home/bin/tmux"; chmod +x "$home/bin/tmux"
+  AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" assign emp -- 'next task' >/dev/null 2>&1 || true
+  if grep -q -- '--resume abc-123-uuid' "$home/runs/AID2/run.sh" 2>/dev/null; then :; else
+    echo "FAIL: assign did not build a --resume runner"; fail=1
+  fi
+
+  rm -rf "$home"
+  if [[ "$fail" == 0 ]]; then echo "selftest OK"; else echo "selftest FAILED"; exit 1; fi
+}
+
 cmd="${1:-}"
 if [[ $# -gt 0 ]]; then shift; fi
 case "$cmd" in
@@ -358,9 +556,11 @@ case "$cmd" in
   status|show) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_status "$@" ;;
   log|logs) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_log "$@" ;;
   send) [[ $# -ge 2 ]] || { usage; exit 1; }; cmd_send "$@" ;;
+  assign) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_assign "$@" ;;
   stop|kill) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_stop "$@" ;;
   rm|remove) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_rm "$@" ;;
   doctor) cmd_doctor ;;
+  selftest) cmd_selftest ;;
   help|--help|-h|'') usage ;;
   *) echo "ERROR: unknown command: $cmd" >&2; usage; exit 1 ;;
 esac

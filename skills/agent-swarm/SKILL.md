@@ -94,12 +94,44 @@ agent-swarm log auth-tests 120
 # Send input to a still-running interactive worker
 agent-swarm send auth-tests 'Use option B and continue.'
 
-# Stop a worker
+# Reuse / resurrect a worker for a new task, keeping its prior context
+agent-swarm assign auth-tests -- 'Address the review comments and re-run the tests.'
+
+# Stop a worker (sends it home; keeps its registry row + conversation id)
 agent-swarm stop auth-tests
 
-# Remove from registry
+# Remove from registry (forgets it)
 agent-swarm rm auth-tests
 ```
+
+## Persistent employees
+
+A worker is an employee, not a one-shot job. Instead of spawning a fresh agent
+for every task (and again for the fix after a review), reuse the same one so it
+keeps the context of what it already did.
+
+- `spawn` hires an employee and gives it a stable conversation id.
+- `assign <name> -- '<task>'` gives it new work. If it's a live interactive
+  session, the task is typed in; otherwise the employee is relaunched
+  **resuming its prior conversation** (Claude `--resume`, Codex `exec resume`)
+  in the same cwd, so it remembers its earlier work.
+- `stop` sends it home but keeps its row and conversation id.
+- `rm` fires it and forgets the conversation.
+
+Reviewer/fixer loop with persistent employees:
+
+```bash
+agent-swarm spawn --name coder --engine codex --cwd <worktree> -- '<implement>'
+# ... reviewer reviews the diff ...
+agent-swarm assign coder -- 'Reviewer says: <feedback>. Fix and re-run checks.'
+```
+
+The coder fixes its own code with full memory of why it wrote it that way — no
+re-explaining the task to a fresh agent.
+
+A long-lived employee resumes its **whole** transcript each time, so context and
+cost grow per task. Keep one employee to one cwd/branch, and recycle it (`rm` +
+`spawn`) when its conversation gets large or its work is unrelated.
 
 ## Engines
 
@@ -121,8 +153,10 @@ Codex requires a git repo.
 Options:
 
 ```bash
---no-full-auto     # no auto approval
---yolo             # dangerous; only if user explicitly asks
+--no-full-auto         # no auto approval
+--yolo                 # dangerous; only if user explicitly asks
+--model gpt-5.5        # pin the codex model (reused when the worker is resumed)
+--reasoning xhigh      # reasoning effort: minimal|low|medium|high|xhigh
 ```
 
 ### Claude worker

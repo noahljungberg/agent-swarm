@@ -37,13 +37,19 @@ git clone https://github.com/noahljungberg/agent-swarm ~/agent-swarm
 ## Use
 
 ```bash
-agent-swarm spawn --name api-tests --engine codex --cwd ~/repo -- 'Add auth tests. Commit. Do not push.'
+agent-swarm spawn --name coder --engine codex --model gpt-5.5 --reasoning xhigh --cwd ~/repo -- 'Add auth tests. Commit. Do not push.'
 agent-swarm list
-agent-swarm log api-tests 120
-agent-swarm send api-tests 'Use option B and continue.'
-agent-swarm stop api-tests
-agent-swarm rm api-tests
+agent-swarm log coder 120
+agent-swarm send coder 'Use option B and continue.'
+agent-swarm assign coder -- 'Address the review comments and re-run the tests.'
+agent-swarm stop coder
+agent-swarm rm coder
 ```
+
+Workers are **persistent employees**: `stop` sends one home keeping its
+conversation id, and `assign` calls it back with new work, resuming its prior
+context (Claude `--resume`, Codex `exec resume`) instead of spawning a fresh
+agent. Run `agent-swarm selftest` to sanity-check the install.
 
 Engines: `codex` (default), `claude`, `hermes`, `shell`. Full orchestration
 workflow and safety rules are in `skills/agent-swarm/SKILL.md`.
