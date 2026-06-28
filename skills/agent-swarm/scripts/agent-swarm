@@ -93,11 +93,13 @@ resolve_ref() {
   local line exact_name exact_id prefix
   exact_id=$(awk -F '\t' -v r="$ref" '$1 == r {print $1; exit}' "$STATE_FILE")
   if [[ -n "$exact_id" ]]; then printf '%s' "$exact_id"; return 0; fi
-  # Prefer the NEWEST matching row (last appended): an orchestrator that reuses a
-  # bare name across rounds must resolve to the current worker, not a stale one.
-  exact_name=$(awk -F '\t' -v r="$ref" '$2 == r {v=$1} END{if(v) print v}' "$STATE_FILE")
+  # Return the NEWEST row for a reused name. Workers are spawned with --name <family>
+  # every round, so same-name rows accumulate chronologically; matching the first
+  # (oldest) row makes `wait`/`log` resolve to a prior round's finished worker and
+  # silently desync the loop. Take the last match instead.
+  exact_name=$(awk -F '\t' -v r="$ref" '$2 == r {id=$1} END {if (id != "") print id}' "$STATE_FILE")
   if [[ -n "$exact_name" ]]; then printf '%s' "$exact_name"; return 0; fi
-  prefix=$(awk -F '\t' -v r="$ref" 'index($1, r) == 1 {v=$1} END{if(v) print v}' "$STATE_FILE")
+  prefix=$(awk -F '\t' -v r="$ref" 'index($1, r) == 1 {print $1; exit}' "$STATE_FILE")
   if [[ -n "$prefix" ]]; then printf '%s' "$prefix"; return 0; fi
   echo "ERROR: no tracked agent matches: $ref" >&2
   exit 1
@@ -185,15 +187,17 @@ build_runner() {
     echo 'echo "__AGENT_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
     # Write the exit code straight to EXIT_FILE (and the sentinel straight to the
     # log) from the trap so terminal status survives even if `tee` was killed.
-    echo 'trap '\''rc=$?; printf "%s\n" "$rc" >"$EXIT_FILE"; { echo "__AGENT_EXIT_CODE=$rc"; echo "__AGENT_ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } >>"$LOG_FILE"; exit $rc'\'' EXIT'
+    echo 'trap '\''rc=${__ENGINE_RC:-$?}; printf "%s\n" "$rc" >"$EXIT_FILE"; { echo "__AGENT_EXIT_CODE=$rc"; echo "__AGENT_ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } >>"$LOG_FILE"; exit $rc'\'' EXIT'
     printf 'cd %q\n' "$cwd"
     printf 'PROMPT_FILE=%q\n' "$prompt_file"
     echo 'PROMPT="$(<"$PROMPT_FILE")"'
     if [[ "$capture_codex" == 1 ]]; then echo '__mark="$(mktemp)"'; fi
     printf '%s\n' "$cmdline"
-    # Capture the engine's real exit code BEFORE the codex-capture block runs, so
-    # the EXIT trap's $? reflects the engine and not the trailing find/if.
-    echo '__engine_rc=$?'
+    # Record the ENGINE's exit status immediately. The runner is `set +e` (no -e), so
+    # without this the EXIT trap would read $? of the post-run rollout-capture block
+    # below (almost always 0) and mask a failed codex/claude worker. The trap prefers
+    # __ENGINE_RC, so terminal status reflects the engine, not the capture heuristic.
+    echo '__ENGINE_RC=$?'
     if [[ "$capture_codex" == 1 ]]; then
       cat <<'CAP'
 # ponytail: capture the Codex session id from the rollout written during this run
@@ -208,8 +212,6 @@ if [ -n "$__newest" ]; then
 fi
 CAP
     fi
-    # Exit with the engine's status so the EXIT trap records the true exit code.
-    echo 'exit $__engine_rc'
   } > "$runner"
   chmod +x "$runner"
 }
@@ -307,7 +309,10 @@ cmd_spawn() {
   id="$(new_id)"
   name="${name:-$engine-$id}"
   safe_name="$(slugify "$name")"
-  session="agent-${safe_name}-${id##*-}"
+  # Full id (timestamp+rand), not just the trailing 4 digits — two same-name workers
+  # spawned in the same second could otherwise collide on the session name and the
+  # 2nd `tmux new-session` would fail.
+  session="agent-${safe_name}-${id}"
   agent_dir="$RUN_DIR/$id"
   mkdir -p "$agent_dir"
   created="$(now_iso)"
@@ -557,6 +562,9 @@ cmd_wait() {
     exit_file="$RUN_DIR/$id/exit_code"; ec="?"
     if [[ -f "$exit_file" ]]; then ec=$(<"$exit_file"); fi
     printf '%-20s %-24s %-10s exit=%s\n' "$id" "$name" "$st" "$ec"
+    # `exited` = tmux gone with no exit_code file (worker killed before its trap ran:
+    # SIGKILL/OOM/host stop). Outcome unknown → treat as failure so the orchestrator
+    # never reads a dead worker as a clean finish.
     if [[ "$st" == "running" || "$st" == "failed" || "$st" == "exited" ]]; then rc=1; fi
   done
   return "$rc"
@@ -601,6 +609,13 @@ cmd_selftest() {
   if grep -q -- '--resume abc-123-uuid' "$home/runs/AID2/run.sh" 2>/dev/null; then :; else
     echo "FAIL: assign did not build a --resume runner"; fail=1
   fi
+
+  # resolve_ref must return the NEWEST row when a name is reused across rounds.
+  printf 'OLD1\tfam\tcodex\t/tmp\texec\ts1\tstopped\t2026-01-01T00:00:00Z\t2026-01-01T00:00:00Z\t\t\tcodex\n' >> "$sf"
+  printf 'NEW1\tfam\tcodex\t/tmp\texec\ts2\tstopped\t2026-01-02T00:00:00Z\t2026-01-02T00:00:00Z\t\t\tcodex\n' >> "$sf"
+  local rr
+  rr=$(AGENT_SWARM_HOME="$home" "$self" status fam | awk -F': *' '/^id:/{print $2}')
+  [[ "$rr" == "NEW1" ]] || { echo "FAIL: resolve_ref(reused name) = '$rr' (want NEW1, the newest)"; fail=1; }
 
   rm -rf "$home"
   if [[ "$fail" == 0 ]]; then echo "selftest OK"; else echo "selftest FAILED"; exit 1; fi
