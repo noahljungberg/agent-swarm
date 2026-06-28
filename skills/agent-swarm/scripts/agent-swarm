@@ -18,6 +18,7 @@ Usage:
   agent-swarm spawn [options] -- <prompt text>
   agent-swarm list
   agent-swarm status <id-or-name>
+  agent-swarm wait <id-or-name>... [--timeout S] [--interval S]
   agent-swarm log <id-or-name> [lines]
   agent-swarm send <id-or-name> <text>
   agent-swarm assign <id-or-name> -- <task text>
@@ -92,9 +93,11 @@ resolve_ref() {
   local line exact_name exact_id prefix
   exact_id=$(awk -F '\t' -v r="$ref" '$1 == r {print $1; exit}' "$STATE_FILE")
   if [[ -n "$exact_id" ]]; then printf '%s' "$exact_id"; return 0; fi
-  exact_name=$(awk -F '\t' -v r="$ref" '$2 == r {print $1; exit}' "$STATE_FILE")
+  # Prefer the NEWEST matching row (last appended): an orchestrator that reuses a
+  # bare name across rounds must resolve to the current worker, not a stale one.
+  exact_name=$(awk -F '\t' -v r="$ref" '$2 == r {v=$1} END{if(v) print v}' "$STATE_FILE")
   if [[ -n "$exact_name" ]]; then printf '%s' "$exact_name"; return 0; fi
-  prefix=$(awk -F '\t' -v r="$ref" 'index($1, r) == 1 {print $1; exit}' "$STATE_FILE")
+  prefix=$(awk -F '\t' -v r="$ref" 'index($1, r) == 1 {v=$1} END{if(v) print v}' "$STATE_FILE")
   if [[ -n "$prefix" ]]; then printf '%s' "$prefix"; return 0; fi
   echo "ERROR: no tracked agent matches: $ref" >&2
   exit 1
@@ -188,6 +191,9 @@ build_runner() {
     echo 'PROMPT="$(<"$PROMPT_FILE")"'
     if [[ "$capture_codex" == 1 ]]; then echo '__mark="$(mktemp)"'; fi
     printf '%s\n' "$cmdline"
+    # Capture the engine's real exit code BEFORE the codex-capture block runs, so
+    # the EXIT trap's $? reflects the engine and not the trailing find/if.
+    echo '__engine_rc=$?'
     if [[ "$capture_codex" == 1 ]]; then
       cat <<'CAP'
 # ponytail: capture the Codex session id from the rollout written during this run
@@ -202,6 +208,8 @@ if [ -n "$__newest" ]; then
 fi
 CAP
     fi
+    # Exit with the engine's status so the EXIT trap records the true exit code.
+    echo 'exit $__engine_rc'
   } > "$runner"
   chmod +x "$runner"
 }
@@ -504,6 +512,56 @@ cmd_rm() {
   echo "removed $id from registry and purged its files"
 }
 
+# Block until the named workers are no longer running: one call waits for a whole
+# worker fleet instead of turn-polling `list`. Prints a final status line per
+# worker. Exits non-zero if any failed, or (with --timeout) if any is still
+# running when the deadline hits.
+cmd_wait() {
+  local timeout=0 interval=5
+  local refs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout) need_val "$@"; timeout="$2"; shift 2 ;;
+      --interval) need_val "$@"; interval="$2"; shift 2 ;;
+      --) shift; while [[ $# -gt 0 ]]; do refs+=("$1"); shift; done ;;
+      *) refs+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#refs[@]} -ge 1 ]] || { echo "usage: agent-swarm wait <id-or-name>... [--timeout S] [--interval S]" >&2; exit 1; }
+
+  local ids=() r id st
+  for r in "${refs[@]}"; do ids+=("$(resolve_ref "$r")"); done
+
+  local start pending now elapsed
+  start=$(date +%s)
+  while :; do
+    pending=0
+    for id in "${ids[@]}"; do
+      st=$(agent_runtime_status "$id")
+      if [[ "$st" == "running" ]]; then pending=$((pending + 1)); fi
+    done
+    if [[ "$pending" -eq 0 ]]; then break; fi
+    now=$(date +%s); elapsed=$((now - start))
+    if [[ "$timeout" -gt 0 && "$elapsed" -ge "$timeout" ]]; then
+      echo "wait: timed out after ${elapsed}s with $pending still running" >&2
+      break
+    fi
+    sleep "$interval"
+  done
+
+  local rc=0 name ec exit_file
+  for id in "${ids[@]}"; do
+    st=$(agent_runtime_status "$id")
+    rewrite_status "$id" "$st"
+    name=$(field "$id" 2)
+    exit_file="$RUN_DIR/$id/exit_code"; ec="?"
+    if [[ -f "$exit_file" ]]; then ec=$(<"$exit_file"); fi
+    printf '%-20s %-24s %-10s exit=%s\n' "$id" "$name" "$st" "$ec"
+    if [[ "$st" == "running" || "$st" == "failed" || "$st" == "exited" ]]; then rc=1; fi
+  done
+  return "$rc"
+}
+
 cmd_doctor() {
   echo "agent-swarm home: $SWARM_HOME"
   echo "state file:       $STATE_FILE"
@@ -554,6 +612,7 @@ case "$cmd" in
   spawn) cmd_spawn "$@" ;;
   list|ls) cmd_list ;;
   status|show) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_status "$@" ;;
+  wait) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_wait "$@" ;;
   log|logs) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_log "$@" ;;
   send) [[ $# -ge 2 ]] || { usage; exit 1; }; cmd_send "$@" ;;
   assign) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_assign "$@" ;;
