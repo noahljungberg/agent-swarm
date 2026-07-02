@@ -63,6 +63,23 @@ Do not spawn workers for:
 - Multiple tasks that will edit the same files concurrently
 - Production/deploy actions unless the user explicitly asked and the repo runbook permits it
 
+Picking the right models for workflows and subagents
+Rankings, higher = better. Cost reflects actual paid cost in practice, not list price. Intelligence is how hard a problem you can hand the model unsupervised. Taste covers UI/UX, code quality, API design, and copy.
+
+model	cost	intelligence	taste
+gpt-5.5	9	8	5
+opus-4.8	4	7	8
+fable-5	2	9	9
+How to apply:
+
+These are defaults, not limits. You have standing permission to override them: if a cheaper model's output does not meet the bar, rerun or redo with a smarter model without asking.
+Judge output quality, not price tags. Escalating is cheaper than shipping mediocre work.
+Cost is a tie-breaker only; when axes conflict for anything that ships: intelligence > taste > cost.
+Bulk/mechanical work (clear-spec implementation, data analysis, migrations): use gpt-5.5.
+Anything user-facing (UI, copy, API design) needs taste >= 7.
+Reviews of plans/implementations: use fable-5 or opus-4.8; optionally add gpt-5.5 as an extra independent perspective.
+Never use Haiku.
+
 ## First command
 
 Always check the tool before using it:
