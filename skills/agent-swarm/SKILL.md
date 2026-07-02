@@ -255,11 +255,20 @@ Workers:
 
 For code-changing workers, prefer one git worktree per worker.
 
+**NEVER put a worktree (or any worker working files) under `/tmp`.** `/tmp` is
+volatile — it is wiped on reboot/crash and on session teardown. A worker mid-build
+with uncommitted edits there loses everything when the box restarts (this has
+already cost a 36-minute run). Use a persistent location like
+`/home/$USER/agent-worktrees/<task-slug>`. Worktree commits live in the main
+repo's shared `.git`, so committed work survives even if the worktree dir is
+later removed — but only if it was committed. Pair this with the commit-first
+rule below.
+
 ```bash
 ROOT=/path/to/repo
 BASE=main
 BRANCH=agent/<task-slug>
-WORKTREE=/tmp/agent-worktrees/<task-slug>
+WORKTREE="$HOME/agent-worktrees/<task-slug>"   # persistent — never /tmp
 
 cd "$ROOT"
 git fetch --all --prune
@@ -268,6 +277,21 @@ git worktree add -b "$BRANCH" "$WORKTREE" "$BASE"
 ```
 
 If the main working tree is dirty, do not spawn a worker from it unless the user explicitly approves.
+
+**Durability for slow builds.** A worker that sits on a multi-minute build with
+uncommitted work loses it if the box restarts. Two ways to be safe, in order of
+preference:
+- **Persistent worktree (always do this):** under `$HOME/...`, the worker's
+  uncommitted edits survive teardown on disk, so the orchestrator can commit
+  them at review time even if the worker never did.
+- **Commit-first (when the worker CAN commit):** have the worker commit each
+  item before building, build as post-commit verification (amend on fix). BUT
+  note a Codex sandbox often CANNOT commit inside a git worktree — the worktree's
+  gitdir lives at `<mainrepo>/.git/worktrees/<name>`, outside the sandbox-writable
+  cwd, so `git commit` fails EROFS. When that happens, don't fight it: tell the
+  worker NOT to commit/stash/reset, and have the orchestrator commit frequently
+  from its own non-sandboxed shell. The persistent location (not worker commits)
+  is what actually guarantees durability.
 
 ### 4. Write self-contained worker prompts
 
@@ -376,6 +400,8 @@ Agent swarm result:
 - No overlapping file edits across concurrent workers.
 - Keep worker count reasonable; default max 4.
 - Prefer worktrees for code-changing workers.
+- NEVER place worktrees or worker files under `/tmp` — it is wiped on crash/reboot/teardown and loses uncommitted work. Use `$HOME/agent-worktrees/...`.
+- Tell workers to commit each item before any long build, so a teardown can't eat uncommitted work.
 - The orchestrator owns review and integration; workers do bounded tasks.
 
 ## If `agent-swarm` is missing
