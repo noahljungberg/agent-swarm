@@ -23,8 +23,11 @@ This is generic. Do not assume StohnTrade unless the user explicitly names that 
 
 ## Core model
 
-The current Claude Code or Codex session is the orchestrator.
-Worker agents are separate terminal processes, usually in tmux sessions, tracked by the `agent-swarm` CLI.
+The current Claude Code or Codex session is the orchestrator — the senior
+developer. Workers are **persistent employees** — junior developers in live
+tmux sessions, hired once per conversation and reused for every follow-up
+task, tracked by the `agent-swarm` CLI. The cardinal sin of orchestration is
+spawning a fresh agent for work an existing employee already has context on.
 
 State lives in:
 
@@ -92,11 +95,11 @@ agent-swarm doctor
 ## Basic commands
 
 ```bash
-# Spawn a Codex worker in the current repo
-agent-swarm spawn --name auth-tests --engine codex --cwd "$PWD" -- \
+# Hire a persistent Codex employee (live TUI in tmux — the default for coders)
+agent-swarm spawn --name coder --engine codex --mode interactive --cwd "$PWD" -- \
   'Add missing auth tests. Follow AGENTS.md. Commit when done. Do not push.'
 
-# Spawn a Claude worker in print/one-shot mode
+# One-shot Claude worker in print mode (fire-and-forget tasks)
 agent-swarm spawn --name security-review --engine claude --cwd "$PWD" -- \
   'Review this codebase for security issues. Write findings to SECURITY_REVIEW.md.'
 
@@ -104,66 +107,94 @@ agent-swarm spawn --name security-review --engine claude --cwd "$PWD" -- \
 agent-swarm list
 
 # Show one worker metadata
-agent-swarm status auth-tests
+agent-swarm status coder
 
-# Tail persistent logs
-agent-swarm log auth-tests 120
+# Read a worker (live TUI pane for interactive workers, log tail for exec)
+agent-swarm log coder 120
 
-# Send input to a still-running interactive worker
-agent-swarm send auth-tests 'Use option B and continue.'
+# Is an interactive employee mid-task? ("busy" rc=0 / "idle" rc=1)
+agent-swarm busy coder
 
-# Reuse / resurrect a worker for a new task, keeping its prior context
-agent-swarm assign auth-tests -- 'Address the review comments and re-run the tests.'
+# Steer a live worker — queued behind the current turn if it is busy
+agent-swarm send coder 'Use option B and continue.'
+
+# Hard-steer: cut the current turn (Esc), then send the correction
+agent-swarm interrupt coder
+agent-swarm send coder 'Stop — wrong file. Edit src/auth.ts instead.'
+
+# Give an employee its next task, keeping its prior context
+agent-swarm assign coder -- 'Address the review comments and re-run the tests.'
+
+# Block until workers are done (exec: exited; interactive: idle at composer)
+agent-swarm wait coder security-review --timeout 1800
 
 # Stop a worker (sends it home; keeps its registry row + conversation id)
-agent-swarm stop auth-tests
+agent-swarm stop coder
 
 # Remove from registry (forgets it)
-agent-swarm rm auth-tests
+agent-swarm rm coder
 ```
 
-## Persistent employees
+## Persistent employees — the default operating model
 
-A worker is an employee, not a one-shot job. Instead of spawning a fresh agent
-for every task (and again for the fix after a review), reuse the same one so it
-keeps the context of what it already did.
+A worker is an employee, not a one-shot job. Hire once per conversation, then
+`assign` every follow-up to the same employee. It keeps the full context of
+what it built and why, and its conversation prefix stays warm in the provider's
+prompt cache — a fresh agent pays for re-reading the repo and re-deriving
+context every time.
+
+**Hire coders as `--mode interactive`.** The engine's TUI stays alive in tmux
+between tasks: follow-ups are typed straight in (no relaunch), you can steer it
+mid-task, and `wait` returns when it goes idle. Use plain exec mode only for
+fire-and-forget one-shots you will never follow up on.
+
+**Reuse rule — check before every spawn.** Run `agent-swarm list` first. If an
+employee's cwd/mission overlaps the new task, `assign` it instead of spawning.
+Spawn a new employee only when:
+
+- the task is in a different repo/worktree than every existing employee, or
+- you need parallelism an existing employee can't give, or
+- the employee's conversation has grown so large it is degrading — then
+  recycle (`rm` + `spawn`) and say so.
+
+Lifecycle:
 
 - `spawn` hires an employee and gives it a stable conversation id.
 - `assign <name> -- '<task>'` gives it new work. If it's a live interactive
   session, the task is typed in; otherwise the employee is relaunched
-  **resuming its prior conversation** (Claude `--resume`, Codex `exec resume`)
-  in the same cwd, so it remembers its earlier work.
+  **resuming its prior conversation** (Claude `--resume`, Codex `resume` /
+  `exec resume`) in the same cwd, so it remembers its earlier work — this
+  survives reboots and killed tmux sessions.
 - `stop` sends it home but keeps its row and conversation id.
 - `rm` fires it and forgets the conversation.
 
-Reviewer/fixer loop with persistent employees:
+Steering a live employee mid-task:
 
-```bash
-agent-swarm spawn --name coder --engine codex --cwd <worktree> -- '<implement>'
-# ... reviewer reviews the diff ...
-agent-swarm assign coder -- 'Reviewer says: <feedback>. Fix and re-run checks.'
-```
+- `send <name> '<msg>'` — types into the TUI; if the employee is mid-turn the
+  message queues and is handled next.
+- `interrupt <name>` — sends Esc to cut the current turn, for when it is going
+  down the wrong path; follow with `send` to redirect.
 
-The coder fixes its own code with full memory of why it wrote it that way — no
-re-explaining the task to a fresh agent.
-
-A long-lived employee resumes its **whole** transcript each time, so context and
-cost grow per task. Keep one employee to one cwd/branch, and recycle it (`rm` +
-`spawn`) when its conversation gets large or its work is unrelated.
+A long-lived employee's context grows per task. Keep one employee to one
+cwd/branch, and recycle it (`rm` + `spawn`) when its conversation gets large or
+its work is unrelated.
 
 ## Engines
 
 ### Codex worker, default
 
 ```bash
+# persistent employee (default for implementation work)
+agent-swarm spawn --engine codex --mode interactive --name <name> --cwd <dir> -- '<prompt>'
+
+# fire-and-forget one-shot
 agent-swarm spawn --engine codex --name <name> --cwd <dir> -- '<prompt>'
 ```
 
-Default command inside tmux:
-
-```bash
-codex exec --full-auto '<prompt>'
-```
+Commands inside tmux: interactive runs
+`codex -s workspace-write -a never --no-alt-screen '<prompt>'` (the TUI stays
+open between tasks; the runner pre-trusts the cwd so fresh worktrees don't
+block on the trust dialog); exec runs `codex exec --full-auto '<prompt>'`.
 
 Use Codex for implementation workers by default.
 Codex requires a git repo.
@@ -231,25 +262,30 @@ Bad splits:
 - One worker depends on uncommitted work from another
 - Vague tasks like "fix everything"
 
-### 2. Make a task table before spawning
+### 2. Propose the roster, then hire
 
-Before launching workers, write a compact plan:
+First check for employees you already have: `agent-swarm list`. Reuse any whose
+cwd/mission fits (`assign`), and only roster what's missing.
+
+Before hiring, tell the user who you plan to employ and why:
 
 ```text
-Workers:
-1. name: api-tests
-   cwd: /path/to/repo-or-worktree
-   engine: codex
-   mission: add missing API tests
-   branch/worktree: fix/api-tests
+Roster:
+1. name: coder
+   engine: codex (interactive — persistent employee)
+   cwd: /path/to/worktree
+   mission: implement the API tests; will also handle review fixes later
    acceptance: tests pass; local commit created
 
-2. name: api-review
-   cwd: /path/to/repo-or-worktree
-   engine: claude
-   mission: review API diff after worker finishes
-   dependency: api-tests done
+2. name: reviewer
+   engine: claude (exec one-shot per review)
+   mission: review coder's diff against the spec
+   dependency: coder idle
 ```
+
+Once the user agrees, that roster IS the team for the rest of the
+conversation. Five turns later, a new implementation task goes to `coder` via
+`assign` — not to a new spawn.
 
 ### 3. Use isolated worktrees for code changes
 

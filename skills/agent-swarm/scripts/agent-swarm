@@ -21,6 +21,8 @@ Usage:
   agent-swarm wait <id-or-name>... [--timeout S] [--interval S]
   agent-swarm log <id-or-name> [lines]
   agent-swarm send <id-or-name> <text>
+  agent-swarm busy <id-or-name>
+  agent-swarm interrupt <id-or-name>
   agent-swarm assign <id-or-name> -- <task text>
   agent-swarm stop <id-or-name>
   agent-swarm rm <id-or-name>
@@ -44,16 +46,22 @@ Spawn options:
   --detach-only           Create tracker + tmux session, do not wait (default)
 
 Persistent employees:
-  A spawned worker is an employee, not a one-shot job. `stop` sends it home but
-  keeps its registry row and conversation id; `assign` calls it back with new
-  work, resuming its prior context; `rm` forgets it.
+  A spawned worker is an employee, not a one-shot job. Spawn with
+  `--mode interactive` to keep the engine's TUI alive in tmux between tasks:
+  `assign`/`send` type follow-ups straight into the live session (steering
+  mid-task works — messages queue; `interrupt` sends Esc to cut the current
+  turn), `busy` reports whether it is mid-task, and `wait` treats an idle
+  employee as done. `stop` sends it home but keeps its registry row and
+  conversation id; `assign` calls it back with new work, resuming its prior
+  context; `rm` forgets it.
 
   agent-swarm assign <id-or-name> -- <task text>
   agent-swarm assign <id-or-name> --prompt-file FILE
 
   If the worker is a live interactive session, the task is typed in. Otherwise
   the worker is relaunched resuming its stored conversation (Claude --resume /
-  Codex `exec resume`) in the same cwd, so it remembers what it did before.
+  Codex `resume` / `exec resume`) in the same cwd, so it remembers what it did
+  before.
 
 Examples:
   agent-swarm spawn --name api-tests --engine codex --cwd ~/repo -- 'Add tests for auth service. Commit when done.'
@@ -126,6 +134,30 @@ tmux_alive() {
   tmux has-session -t "$session" >/dev/null 2>&1
 }
 
+# Type text into a live TUI and submit it. The pause matters: a fast literal
+# burst trips the TUI's paste detection, and an immediate Enter lands inside
+# that window as a newline instead of submitting. Multi-line text is fine —
+# it becomes one multi-line message submitted by the delayed Enter.
+type_into_session() {
+  local session="$1" text="$2"
+  tmux send-keys -t "$session" -l -- "$text"
+  sleep 0.4
+  tmux send-keys -t "$session" Enter
+}
+
+# Is a live interactive worker mid-task? Busy iff its pane shows the engine's
+# "esc to interrupt" spinner; a rendered composer with no spinner is idle.
+# ponytail: verified against codex TUI 0.142; composer regex may need extending
+# for claude interactive. A TUI still starting up (no composer yet) counts busy.
+session_busy() {
+  local session="$1" pane
+  tmux_alive "$session" || return 1
+  pane="$(tmux capture-pane -t "$session" -p 2>/dev/null)"
+  if grep -qi 'esc to interrupt' <<<"$pane"; then return 0; fi
+  if grep -qE '[›❯]' <<<"$pane"; then return 1; fi
+  return 0
+}
+
 agent_runtime_status() {
   local id="$1" session stored exit_file rc
   session=$(field "$id" 6)
@@ -172,10 +204,13 @@ append_agent() {
 }
 
 # Emit a runner script for tmux. `capture_codex=1` appends logic that records the
-# Codex rollout id so the worker can later be resumed. `cmdline` must contain a
-# literal "$PROMPT" (it is expanded inside the runner at run time).
+# Codex rollout id so the worker can later be resumed. `interactive=1` skips the
+# tee redirect (a TUI dies with "stdout is not a terminal" behind a pipe — read a
+# live interactive worker via `agent-swarm log`, which captures the pane) and
+# pre-trusts the cwd so codex doesn't block on its trust dialog. `cmdline` must
+# contain a literal "$PROMPT" (it is expanded inside the runner at run time).
 build_runner() {
-  local runner="$1" log_file="$2" exit_file="$3" cwd="$4" prompt_file="$5" sid_file="$6" capture_codex="$7" cmdline="$8"
+  local runner="$1" log_file="$2" exit_file="$3" cwd="$4" prompt_file="$5" sid_file="$6" capture_codex="$7" interactive="$8" cmdline="$9"
   {
     echo '#!/usr/bin/env bash'
     echo 'set -uo pipefail'
@@ -183,8 +218,12 @@ build_runner() {
     printf 'EXIT_FILE=%q\n' "$exit_file"
     printf 'SID_FILE=%q\n' "$sid_file"
     echo ': >>"$LOG_FILE"'
-    echo 'exec > >(tee -a "$LOG_FILE") 2>&1'
-    echo 'echo "__AGENT_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+    if [[ "$interactive" == 1 ]]; then
+      echo 'echo "__AGENT_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG_FILE"'
+    else
+      echo 'exec > >(tee -a "$LOG_FILE") 2>&1'
+      echo 'echo "__AGENT_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+    fi
     # Write the exit code straight to EXIT_FILE (and the sentinel straight to the
     # log) from the trap so terminal status survives even if `tee` was killed.
     echo 'trap '\''rc=${__ENGINE_RC:-$?}; printf "%s\n" "$rc" >"$EXIT_FILE"; { echo "__AGENT_EXIT_CODE=$rc"; echo "__AGENT_ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } >>"$LOG_FILE"; exit $rc'\'' EXIT'
@@ -192,13 +231,41 @@ build_runner() {
     printf 'PROMPT_FILE=%q\n' "$prompt_file"
     echo 'PROMPT="$(<"$PROMPT_FILE")"'
     if [[ "$capture_codex" == 1 ]]; then echo '__mark="$(mktemp)"'; fi
+    if [[ "$interactive" == 1 && "$capture_codex" == 1 ]]; then
+      cat <<'PRETRUST'
+# Pre-trust the cwd (same as answering "Yes" to the trust dialog once) so an
+# unattended TUI employee never blocks on it. Codex ignores -c trust overrides.
+__cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
+if ! grep -qF "[projects.\"$PWD\"]" "$__cfg" 2>/dev/null; then
+  printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$PWD" >> "$__cfg"
+fi
+# The rollout file appears seconds after the TUI starts; capture its session id
+# in the background so the employee is resumable even if this tmux session is
+# later killed (stop/crash) without running any post-exit code.
+# ponytail: newest-rollout-matching-cwd heuristic; two employees spawned in the
+# same cwd within ~2s can cross-capture. Verify against your codex version.
+CODEX_SESSIONS="${CODEX_HOME:-$HOME/.codex}/sessions"
+(
+  for __i in $(seq 1 45); do
+    sleep 2
+    __f="$(find "$CODEX_SESSIONS" -name '*.jsonl' -newer "$__mark" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2- | while IFS= read -r __r; do
+      head -c 4096 "$__r" 2>/dev/null | grep -qF "\"cwd\":\"$PWD\"" && { printf '%s\n' "$__r"; break; }
+    done)"
+    if [ -n "$__f" ]; then
+      __sid="$(basename "$__f" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n1)"
+      [ -n "$__sid" ] && printf '%s\n' "$__sid" >"$SID_FILE" && break
+    fi
+  done
+) &
+PRETRUST
+    fi
     printf '%s\n' "$cmdline"
     # Record the ENGINE's exit status immediately. The runner is `set +e` (no -e), so
     # without this the EXIT trap would read $? of the post-run rollout-capture block
     # below (almost always 0) and mask a failed codex/claude worker. The trap prefers
     # __ENGINE_RC, so terminal status reflects the engine, not the capture heuristic.
     echo '__ENGINE_RC=$?'
-    if [[ "$capture_codex" == 1 ]]; then
+    if [[ "$capture_codex" == 1 && "$interactive" != 1 ]]; then
       cat <<'CAP'
 # ponytail: capture the Codex session id from the rollout written during this run
 # so the worker can be resumed later. UUID-from-rollout heuristic — verify the
@@ -222,16 +289,29 @@ build_cmdline() {
   local engine="$1" mode="$2" resume_sid="$3" codex_auto="$4" codex_flags="$5" \
         claude_danger="$6" max_turns="$7" session_id="$8" shell_cmd="$9"
   CAPTURE_CODEX=0
+  # The TUI rejects exec's --full-auto/--yolo aliases (codex >= 0.142); translate.
+  # --no-alt-screen keeps output linear so tmux scrollback/capture-pane stay readable.
+  local tui_flags="--no-alt-screen"
+  case "$codex_auto" in
+    --full-auto) tui_flags="-s workspace-write -a never --no-alt-screen" ;;
+    --yolo)      tui_flags="--dangerously-bypass-approvals-and-sandbox --no-alt-screen" ;;
+  esac
   case "$engine:$mode" in
+    codex:interactive)
+      if [[ -n "$resume_sid" ]]; then
+        CMDLINE="codex resume $resume_sid $tui_flags${codex_flags:+ $codex_flags} \"\$PROMPT\""
+        COMMAND_TEXT="codex resume $resume_sid $tui_flags $codex_flags <prompt>"
+      else
+        CMDLINE="codex $tui_flags${codex_flags:+ $codex_flags} \"\$PROMPT\""
+        COMMAND_TEXT="codex $tui_flags $codex_flags <prompt>"
+        CAPTURE_CODEX=1
+      fi
+      ;;
     codex:*)
       if [[ -n "$resume_sid" ]]; then
         # ponytail: `codex exec resume <id>` is the documented resume path — verify on your codex.
         CMDLINE="codex exec resume $resume_sid${codex_flags:+ $codex_flags} \"\$PROMPT\""
         COMMAND_TEXT="codex exec resume $resume_sid $codex_flags <prompt>"
-      elif [[ "$mode" == interactive ]]; then
-        CMDLINE="codex${codex_flags:+ $codex_flags} \"\$PROMPT\""
-        COMMAND_TEXT="codex $codex_flags <prompt>"
-        CAPTURE_CODEX=1
       else
         CMDLINE="codex exec${codex_auto:+ $codex_auto}${codex_flags:+ $codex_flags} \"\$PROMPT\""
         COMMAND_TEXT="codex exec $codex_auto $codex_flags <prompt>"
@@ -340,8 +420,9 @@ cmd_spawn() {
   local session_id=""
   [[ "$engine" == claude ]] && session_id="$(gen_uuid)"
 
+  local interactive=0; [[ "$mode" == interactive ]] && interactive=1
   build_cmdline "$engine" "$mode" "" "$codex_auto" "$codex_flags" "$claude_danger" "$max_turns" "$session_id" "$shell_cmd"
-  build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_file" "$sid_file" "$CAPTURE_CODEX" "$CMDLINE"
+  build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_file" "$sid_file" "$CAPTURE_CODEX" "$interactive" "$CMDLINE"
 
   tmux new-session -d -s "$session" -x 140 -y 40 "$runner"
   append_agent "$id" "$name" "$engine" "$cwd" "$mode" "$session" "running" "$created" "$updated" "$prompt_file" "$log_file" "$COMMAND_TEXT" "$session_id"
@@ -381,8 +462,7 @@ cmd_assign() {
   # Live interactive worker: just hand it the task (same as `send`).
   if [[ "$mode" == interactive ]] && tmux_alive "$session"; then
     if [[ -n "$prompt_file" ]]; then prompt="$(<"$prompt_file")"; fi
-    tmux send-keys -t "$session" -l -- "$prompt"
-    tmux send-keys -t "$session" Enter
+    type_into_session "$session" "$prompt"
     rewrite_status "$id" "running"
     echo "assigned to live $id ($session)"
     return 0
@@ -415,8 +495,9 @@ cmd_assign() {
   if [[ -z "$sid" ]]; then
     echo "WARN: no session id stored for $id; starting fresh (prior context not restored)" >&2
   fi
+  local interactive=0; [[ "$mode" == interactive ]] && interactive=1
   build_cmdline "$engine" "$mode" "$sid" "--full-auto" "$codex_flags" "" "30" "" ""
-  build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_path" "$sid_file" "$CAPTURE_CODEX" "$CMDLINE"
+  build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_path" "$sid_file" "$CAPTURE_CODEX" "$interactive" "$CMDLINE"
 
   tmux new-session -d -s "$new_session" -x 140 -y 40 "$runner"
   set_session_running "$id" "$new_session"
@@ -457,12 +538,19 @@ cmd_status() {
 }
 
 cmd_log() {
-  local id lines log_file session
+  local id lines log_file session mode
   id=$(resolve_ref "$1")
   lines="${2:-80}"
   log_file=$(field "$id" 11)
   session=$(field "$id" 6)
-  if [[ -f "$log_file" ]]; then
+  mode=$(field "$id" 5)
+  # A live TUI's real output is its pane, not the log file (interactive runners
+  # don't tee — a TUI dies behind a pipe). Dead interactive workers fall through
+  # to the sparse log (start/exit markers only); their history lives in the
+  # engine's own session store and stays resumable via `assign`.
+  if [[ "$mode" == interactive ]] && tmux_alive "$session"; then
+    tmux capture-pane -t "$session" -p -S "-$lines"
+  elif [[ -f "$log_file" ]]; then
     tail -n "$lines" "$log_file"
   elif tmux_alive "$session"; then
     tmux capture-pane -t "$session" -p -S "-$lines"
@@ -482,11 +570,32 @@ cmd_send() {
     echo "ERROR: tmux session is not alive: $session" >&2
     exit 1
   fi
-  # -l sends the text literally so a lone token like "Enter"/"Up" is typed, not
-  # interpreted as a keypress; the Enter is sent as a separate keystroke.
-  tmux send-keys -t "$session" -l -- "$text"
-  tmux send-keys -t "$session" Enter
+  type_into_session "$session" "$text"
   echo "sent to $id ($session)"
+}
+
+# Interrupt a live interactive worker's current turn (Esc in the codex/claude
+# TUI) so the next `send` steers it hard instead of queueing behind the turn.
+cmd_interrupt() {
+  local id session
+  id=$(resolve_ref "$1")
+  session=$(field "$id" 6)
+  if ! tmux_alive "$session"; then
+    echo "ERROR: tmux session is not alive: $session" >&2
+    exit 1
+  fi
+  tmux send-keys -t "$session" Escape
+  echo "interrupted $id ($session)"
+}
+
+# busy <ref>: exit 0 + "busy" if a live interactive worker is mid-task,
+# exit 1 + "idle" if it's waiting at the composer, exit 2 if not running.
+cmd_busy() {
+  local id session
+  id=$(resolve_ref "$1")
+  session=$(field "$id" 6)
+  tmux_alive "$session" || { echo "not-running"; return 2; }
+  if session_busy "$session"; then echo "busy"; else echo "idle"; return 1; fi
 }
 
 cmd_stop() {
@@ -537,15 +646,25 @@ cmd_wait() {
   local ids=() r id st
   for r in "${refs[@]}"; do ids+=("$(resolve_ref "$r")"); done
 
-  local start pending now elapsed
+  local start pending now elapsed first=1
   start=$(date +%s)
   while :; do
     pending=0
     for id in "${ids[@]}"; do
       st=$(agent_runtime_status "$id")
-      if [[ "$st" == "running" ]]; then pending=$((pending + 1)); fi
+      if [[ "$st" == "running" ]]; then
+        # An interactive employee never exits between tasks; it's "done" when its
+        # TUI goes idle at the composer. "idle" is only trusted after the first
+        # interval — a just-assigned worker can look idle for a beat before its
+        # spinner starts.
+        if [[ "$first" == 0 && "$(field "$id" 5)" == interactive ]] && ! session_busy "$(field "$id" 6)"; then
+          continue
+        fi
+        pending=$((pending + 1))
+      fi
     done
     if [[ "$pending" -eq 0 ]]; then break; fi
+    first=0
     now=$(date +%s); elapsed=$((now - start))
     if [[ "$timeout" -gt 0 && "$elapsed" -ge "$timeout" ]]; then
       echo "wait: timed out after ${elapsed}s with $pending still running" >&2
@@ -558,6 +677,10 @@ cmd_wait() {
   for id in "${ids[@]}"; do
     st=$(agent_runtime_status "$id")
     rewrite_status "$id" "$st"
+    # Report a live-but-idle employee as done ("idle"), not still-running.
+    if [[ "$st" == "running" && "$(field "$id" 5)" == interactive ]] && ! session_busy "$(field "$id" 6)"; then
+      st="idle"
+    fi
     name=$(field "$id" 2)
     exit_file="$RUN_DIR/$id/exit_code"; ec="?"
     if [[ -f "$exit_file" ]]; then ec=$(<"$exit_file"); fi
@@ -602,13 +725,23 @@ cmd_selftest() {
   [[ "$sid" == "abc-123-uuid" ]] || { echo "FAIL: session_id_of emp = '$sid' (want abc-123-uuid)"; fail=1; }
 
   # assign on a dead claude agent must build a runner that resumes the stored id.
-  # Stub tmux so require_tmux/new-session succeed without a real server.
+  # Stub tmux so require_tmux/new-session succeed without a real server;
+  # has-session must fail so dead agents don't look live.
   mkdir -p "$home/bin"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$home/bin/tmux"; chmod +x "$home/bin/tmux"
+  printf '#!/usr/bin/env bash\n[ "$1" = has-session ] && exit 1\nexit 0\n' > "$home/bin/tmux"; chmod +x "$home/bin/tmux"
   AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" assign emp -- 'next task' >/dev/null 2>&1 || true
   if grep -q -- '--resume abc-123-uuid' "$home/runs/AID2/run.sh" 2>/dev/null; then :; else
     echo "FAIL: assign did not build a --resume runner"; fail=1
   fi
+  grep -q 'tee -a' "$home/runs/AID2/run.sh" 2>/dev/null || { echo "FAIL: exec runner lost its tee redirect"; fail=1; }
+
+  # dead interactive codex employee: assign must resume via the TUI (`codex
+  # resume <sid>`), and its runner must NOT tee (a TUI dies behind a pipe).
+  mkdir -p "$home/runs/AID3"
+  printf 'AID3\ttuiemp\tcodex\t/tmp\tinteractive\tsess-y\tstopped\t2026-01-01T00:00:00Z\t2026-01-01T00:00:00Z\t%s/p3.md\t%s/l3.log\tcodex\tcdx-uuid-333\n' "$home" "$home" >> "$sf"
+  AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" assign tuiemp -- 'next task' >/dev/null 2>&1 || true
+  grep -q 'codex resume cdx-uuid-333' "$home/runs/AID3/run.sh" 2>/dev/null || { echo "FAIL: interactive assign did not build a TUI resume runner"; fail=1; }
+  grep -q 'tee -a' "$home/runs/AID3/run.sh" 2>/dev/null && { echo "FAIL: interactive runner must not tee (breaks the TUI)"; fail=1; }
 
   # resolve_ref must return the NEWEST row when a name is reused across rounds.
   printf 'OLD1\tfam\tcodex\t/tmp\texec\ts1\tstopped\t2026-01-01T00:00:00Z\t2026-01-01T00:00:00Z\t\t\tcodex\n' >> "$sf"
@@ -630,6 +763,8 @@ case "$cmd" in
   wait) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_wait "$@" ;;
   log|logs) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_log "$@" ;;
   send) [[ $# -ge 2 ]] || { usage; exit 1; }; cmd_send "$@" ;;
+  busy) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_busy "$@" ;;
+  interrupt) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_interrupt "$@" ;;
   assign) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_assign "$@" ;;
   stop|kill) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_stop "$@" ;;
   rm|remove) [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_rm "$@" ;;
