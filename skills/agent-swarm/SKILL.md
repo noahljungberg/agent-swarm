@@ -69,19 +69,19 @@ Do not spawn workers for:
 Picking the right models for workflows and subagents
 Rankings, higher = better. Cost reflects actual paid cost in practice, not list price. Intelligence is how hard a problem you can hand the model unsupervised. Taste covers UI/UX, code quality, API design, and copy.
 
-| model    | cost | intelligence | taste |
-|----------|------|--------------|-------|
-| gpt-5.5  | 9    | 8            | 5     |
-| sonnet-5 | 5    | 5            | 7     |
-| opus-4.8 | 4    | 7            | 8     |
-| fable-5  | 2    | 9            | 9     |
+| model       | cost | intelligence | taste |
+|-------------|------|--------------|-------|
+| gpt-5.6-sol | 9    | 8            | 5     |
+| sonnet-5    | 5    | 5            | 7     |
+| opus-5      | 4    | 7            | 8     |
+| fable-5     | 2    | 9            | 9     |
 
 These are defaults, not limits. You have standing permission to override them: if a cheaper model's output does not meet the bar, rerun or redo with a smarter model without asking.
 Judge output quality, not price tags. Escalating is cheaper than shipping mediocre work.
 Cost is a tie-breaker only; when axes conflict for anything that ships: intelligence > taste > cost.
-Bulk/mechanical work (clear-spec implementation, data analysis, migrations): use gpt-5.5.
+Bulk/mechanical work (clear-spec implementation, data analysis, migrations): use gpt-5.6-sol.
 Anything user-facing (UI, copy, API design) needs taste >= 7.
-Reviews of plans/implementations: use fable-5 or opus-4.8; optionally add gpt-5.5 as an extra independent perspective.
+Reviews of plans/implementations: use fable-5 or opus-5; optionally add gpt-5.6-sol as an extra independent perspective.
 Never use Haiku or sonnet.
 
 ## First command
@@ -96,11 +96,11 @@ agent-swarm doctor
 
 ```bash
 # Hire a persistent Codex employee (live TUI in tmux — the default for coders)
-agent-swarm spawn --name coder --engine codex --mode interactive --cwd "$PWD" -- \
+agent-swarm spawn --name coder --engine codex --mode interactive --model gpt-5.6-sol --reasoning xhigh --cwd "$PWD" -- \
   'Add missing auth tests. Follow AGENTS.md. Commit when done. Do not push.'
 
 # One-shot Claude worker in print mode (fire-and-forget tasks)
-agent-swarm spawn --name security-review --engine claude --cwd "$PWD" -- \
+agent-swarm spawn --name security-review --engine claude --model claude-opus-5 --cwd "$PWD" -- \
   'Review this codebase for security issues. Write findings to SECURITY_REVIEW.md.'
 
 # List all tracked workers
@@ -183,18 +183,26 @@ its work is unrelated.
 
 ### Codex worker, default
 
+Explicitly pin every Codex worker to `gpt-5.6-sol` or `gpt-5.6-terra` with
+`--reasoning xhigh`. Default to `gpt-5.6-sol`; use `gpt-5.6-terra` when the user
+requests it or Sol is unavailable. Never use or fall back to `gpt-5.5`. If
+neither 5.6 model is available, report the blocker instead of downgrading. Do
+not resume a worker pinned to 5.5; remove it and spawn a 5.6 worker.
+
 ```bash
 # persistent employee (default for implementation work)
-agent-swarm spawn --engine codex --mode interactive --name <name> --cwd <dir> -- '<prompt>'
+agent-swarm spawn --engine codex --mode interactive --model gpt-5.6-sol --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
 
 # fire-and-forget one-shot
-agent-swarm spawn --engine codex --name <name> --cwd <dir> -- '<prompt>'
+agent-swarm spawn --engine codex --model gpt-5.6-sol --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
 ```
 
 Commands inside tmux: interactive runs
-`codex -s workspace-write -a never --no-alt-screen '<prompt>'` (the TUI stays
-open between tasks; the runner pre-trusts the cwd so fresh worktrees don't
-block on the trust dialog); exec runs `codex exec --full-auto '<prompt>'`.
+`codex -s workspace-write -a never --no-alt-screen -m gpt-5.6-sol -c
+model_reasoning_effort=xhigh '<prompt>'` (the TUI stays open between tasks; the
+runner pre-trusts the cwd so fresh worktrees don't block on the trust dialog);
+exec runs `codex exec --full-auto -m gpt-5.6-sol -c
+model_reasoning_effort=xhigh '<prompt>'`.
 
 Use Codex for implementation workers by default.
 Codex requires a git repo.
@@ -204,20 +212,25 @@ Options:
 ```bash
 --no-full-auto         # no auto approval
 --yolo                 # dangerous; only if user explicitly asks
---model gpt-5.5        # pin the codex model (reused when the worker is resumed)
+--model gpt-5.6-sol    # or gpt-5.6-terra; reused when the worker is resumed
 --reasoning xhigh      # reasoning effort: minimal|low|medium|high|xhigh
 ```
 
 ### Claude worker
 
+Explicitly pin every Claude worker to `claude-opus-5`. Never use or fall back
+to Opus 4.8. If Opus 5 is unavailable, report the blocker instead of
+downgrading. Do not resume a worker pinned to 4.8; remove it and spawn an Opus
+5 worker.
+
 ```bash
-agent-swarm spawn --engine claude --name <name> --cwd <dir> -- '<prompt>'
+agent-swarm spawn --engine claude --model claude-opus-5 --name <name> --cwd <dir> -- '<prompt>'
 ```
 
 Default command inside tmux:
 
 ```bash
-claude -p '<prompt>' --max-turns 30
+claude -p --model claude-opus-5 '<prompt>' --max-turns 30
 ```
 
 Use Claude for reviews, planning, architecture, and analysis-heavy tasks.
@@ -362,7 +375,7 @@ Keep prompts specific. A bad worker prompt creates chaos.
 Use `agent-swarm spawn`, not raw tmux, unless the script is missing.
 
 ```bash
-agent-swarm spawn --name <name> --engine codex --cwd <worktree> -- '<prompt>'
+agent-swarm spawn --name <name> --engine codex --mode interactive --model gpt-5.6-sol --reasoning xhigh --cwd <worktree> -- '<prompt>'
 ```
 
 For many workers, spawn at most 4 concurrently unless the user overrides.

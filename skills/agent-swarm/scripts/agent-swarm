@@ -37,7 +37,7 @@ Spawn options:
   --prompt TEXT           Prompt text
   --prompt-file FILE      Read prompt from file
   --cmd COMMAND           For --engine shell only: shell command to run
-  --model NAME            Codex model id (e.g. gpt-5.5); reused on resume
+  --model NAME            Codex/Claude model id; reused on resume
   --reasoning EFFORT      Codex reasoning effort (minimal|low|medium|high|xhigh)
   --no-full-auto          Codex exec without --full-auto
   --yolo                  Codex exec with --yolo instead of --full-auto
@@ -64,9 +64,9 @@ Persistent employees:
   before.
 
 Examples:
-  agent-swarm spawn --name api-tests --engine codex --cwd ~/repo -- 'Add tests for auth service. Commit when done.'
-  agent-swarm spawn --name coder --engine codex --model gpt-5.5 --reasoning xhigh --cwd ~/repo -- 'Implement feature X.'
-  agent-swarm spawn --name review --engine claude --cwd ~/repo -- 'Review this repo for security issues.'
+  agent-swarm spawn --name api-tests --engine codex --model gpt-5.6-sol --reasoning xhigh --cwd ~/repo -- 'Add tests for auth service. Commit when done.'
+  agent-swarm spawn --name coder --engine codex --model gpt-5.6-terra --reasoning xhigh --cwd ~/repo -- 'Implement feature X.'
+  agent-swarm spawn --name review --engine claude --model claude-opus-5 --cwd ~/repo -- 'Review this repo for security issues.'
   agent-swarm list
   agent-swarm log api-tests 120
   agent-swarm send api-tests 'Yes, proceed with option A.'
@@ -287,7 +287,7 @@ CAP
 # `COMMAND_TEXT`, and `CAPTURE_CODEX`. `$PROMPT` is kept literal for the runner.
 build_cmdline() {
   local engine="$1" mode="$2" resume_sid="$3" codex_auto="$4" codex_flags="$5" \
-        claude_danger="$6" max_turns="$7" session_id="$8" shell_cmd="$9"
+        claude_danger="$6" claude_flags="$7" max_turns="$8" session_id="$9" shell_cmd="${10}"
   CAPTURE_CODEX=0
   # The TUI rejects exec's --full-auto/--yolo aliases (codex >= 0.142); translate.
   # --no-alt-screen keeps output linear so tmux scrollback/capture-pane stay readable.
@@ -320,20 +320,20 @@ build_cmdline() {
       ;;
     claude:interactive)
       if [[ -n "$resume_sid" ]]; then
-        CMDLINE="claude --resume $resume_sid${claude_danger:+ $claude_danger} \"\$PROMPT\""
-        COMMAND_TEXT="claude --resume $resume_sid <prompt>"
+        CMDLINE="claude --resume $resume_sid${claude_danger:+ $claude_danger}${claude_flags:+ $claude_flags} \"\$PROMPT\""
+        COMMAND_TEXT="claude --resume $resume_sid $claude_flags <prompt>"
       else
-        CMDLINE="claude --session-id $session_id${claude_danger:+ $claude_danger} \"\$PROMPT\""
-        COMMAND_TEXT="claude --session-id $session_id $claude_danger <prompt>"
+        CMDLINE="claude --session-id $session_id${claude_danger:+ $claude_danger}${claude_flags:+ $claude_flags} \"\$PROMPT\""
+        COMMAND_TEXT="claude --session-id $session_id $claude_danger $claude_flags <prompt>"
       fi
       ;;
     claude:*)
       if [[ -n "$resume_sid" ]]; then
-        CMDLINE="claude -p --resume $resume_sid --max-turns $max_turns \"\$PROMPT\""
-        COMMAND_TEXT="claude -p --resume $resume_sid --max-turns $max_turns <prompt>"
+        CMDLINE="claude -p --resume $resume_sid${claude_flags:+ $claude_flags} --max-turns $max_turns \"\$PROMPT\""
+        COMMAND_TEXT="claude -p --resume $resume_sid $claude_flags --max-turns $max_turns <prompt>"
       else
-        CMDLINE="claude -p --session-id $session_id --max-turns $max_turns \"\$PROMPT\""
-        COMMAND_TEXT="claude -p --session-id $session_id --max-turns $max_turns <prompt>"
+        CMDLINE="claude -p --session-id $session_id${claude_flags:+ $claude_flags} --max-turns $max_turns \"\$PROMPT\""
+        COMMAND_TEXT="claude -p --session-id $session_id $claude_flags --max-turns $max_turns <prompt>"
       fi
       ;;
     hermes:*)
@@ -409,19 +409,24 @@ cmd_spawn() {
     printf '%s\n' "$prompt" > "$prompt_file"
   fi
 
-  # Codex model/reasoning flags, persisted so resurrection reuses them.
-  local codex_flags=""
-  [[ -n "$model" ]] && codex_flags+=" -m $model"
-  [[ -n "$reasoning" ]] && codex_flags+=" -c model_reasoning_effort=$reasoning"
-  codex_flags="${codex_flags# }"
-  [[ "$engine" == codex ]] && printf '%s\n' "$codex_flags" > "$agent_dir/codex_flags"
+  # Keep model flags across resumes
+  local codex_flags="" claude_flags=""
+  if [[ "$engine" == codex ]]; then
+    [[ -n "$model" ]] && codex_flags+=" -m $model"
+    [[ -n "$reasoning" ]] && codex_flags+=" -c model_reasoning_effort=$reasoning"
+    codex_flags="${codex_flags# }"
+    printf '%s\n' "$codex_flags" > "$agent_dir/codex_flags"
+  elif [[ "$engine" == claude ]]; then
+    [[ -n "$model" ]] && claude_flags="--model $model"
+    printf '%s\n' "$claude_flags" > "$agent_dir/claude_flags"
+  fi
 
   # Claude lets us choose the conversation id up front; store it so we can resume.
   local session_id=""
   [[ "$engine" == claude ]] && session_id="$(gen_uuid)"
 
   local interactive=0; [[ "$mode" == interactive ]] && interactive=1
-  build_cmdline "$engine" "$mode" "" "$codex_auto" "$codex_flags" "$claude_danger" "$max_turns" "$session_id" "$shell_cmd"
+  build_cmdline "$engine" "$mode" "" "$codex_auto" "$codex_flags" "$claude_danger" "$claude_flags" "$max_turns" "$session_id" "$shell_cmd"
   build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_file" "$sid_file" "$CAPTURE_CODEX" "$interactive" "$CMDLINE"
 
   tmux new-session -d -s "$session" -x 140 -y 40 "$runner"
@@ -474,7 +479,7 @@ cmd_assign() {
     codex|claude) ;;
     *) echo "ERROR: cannot resume a $engine worker; spawn a new one" >&2; exit 1 ;;
   esac
-  local agent_dir="$RUN_DIR/$id" log_file runner exit_file sid_file new_session safe_name prompt_path sid codex_flags=""
+  local agent_dir="$RUN_DIR/$id" log_file runner exit_file sid_file new_session safe_name prompt_path sid codex_flags="" claude_flags=""
   agent_dir="$RUN_DIR/$id"
   mkdir -p "$agent_dir"
   log_file=$(field "$id" 11); [[ -z "$log_file" ]] && log_file="$LOG_DIR/$id.log"
@@ -483,6 +488,7 @@ cmd_assign() {
   new_session="agent-${safe_name}-$(printf '%04d' $((RANDOM % 10000)))"
   sid="$(session_id_of "$id")"
   [[ -f "$agent_dir/codex_flags" ]] && codex_flags="$(<"$agent_dir/codex_flags")"
+  [[ -f "$agent_dir/claude_flags" ]] && claude_flags="$(<"$agent_dir/claude_flags")"
 
   if [[ -n "$prompt_file" ]]; then
     prompt_path="$(cd "$(dirname "$prompt_file")" && pwd)/$(basename "$prompt_file")"
@@ -496,7 +502,7 @@ cmd_assign() {
     echo "WARN: no session id stored for $id; starting fresh (prior context not restored)" >&2
   fi
   local interactive=0; [[ "$mode" == interactive ]] && interactive=1
-  build_cmdline "$engine" "$mode" "$sid" "--full-auto" "$codex_flags" "" "30" "" ""
+  build_cmdline "$engine" "$mode" "$sid" "--full-auto" "$codex_flags" "" "$claude_flags" "30" "" ""
   build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_path" "$sid_file" "$CAPTURE_CODEX" "$interactive" "$CMDLINE"
 
   tmux new-session -d -s "$new_session" -x 140 -y 40 "$runner"
@@ -724,14 +730,15 @@ cmd_selftest() {
   sid=$(AGENT_SWARM_HOME="$home" "$self" status emp | awk -F': *' '/^session_id:/{print $2}')
   [[ "$sid" == "abc-123-uuid" ]] || { echo "FAIL: session_id_of emp = '$sid' (want abc-123-uuid)"; fail=1; }
 
-  # assign on a dead claude agent must build a runner that resumes the stored id.
-  # Stub tmux so require_tmux/new-session succeed without a real server;
-  # has-session must fail so dead agents don't look live.
+  # Assign keeps the Claude session + model
+  # has-session fails so the dead worker stays dead
   mkdir -p "$home/bin"
   printf '#!/usr/bin/env bash\n[ "$1" = has-session ] && exit 1\nexit 0\n' > "$home/bin/tmux"; chmod +x "$home/bin/tmux"
+  printf '%s\n' '--model claude-opus-5' > "$home/runs/AID2/claude_flags"
   AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" assign emp -- 'next task' >/dev/null 2>&1 || true
-  if grep -q -- '--resume abc-123-uuid' "$home/runs/AID2/run.sh" 2>/dev/null; then :; else
-    echo "FAIL: assign did not build a --resume runner"; fail=1
+  if grep -q -- '--resume abc-123-uuid' "$home/runs/AID2/run.sh" 2>/dev/null &&
+     grep -q -- '--model claude-opus-5' "$home/runs/AID2/run.sh" 2>/dev/null; then :; else
+    echo "FAIL: assign lost Claude session or model"; fail=1
   fi
   grep -q 'tee -a' "$home/runs/AID2/run.sh" 2>/dev/null || { echo "FAIL: exec runner lost its tee redirect"; fail=1; }
 
