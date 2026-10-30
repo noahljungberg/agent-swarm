@@ -1,6 +1,6 @@
 {
   "name": "agent-swarm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Orchestration skill: make the current session a controller that spawns Codex/Claude/Hermes worker agents in tmux, tracks them in a TSV registry, tails logs, sends input, and reviews output.",
   "author": {
     "name": "Noah Ljungberg",

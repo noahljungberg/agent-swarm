@@ -37,8 +37,8 @@ git clone https://github.com/noahljungberg/agent-swarm ~/agent-swarm
 ## Use
 
 ```bash
-agent-swarm spawn --name coder --engine codex --model gpt-5.6-sol --reasoning xhigh --cwd ~/repo -- 'Add auth tests. Commit. Do not push.'
-agent-swarm spawn --name reviewer --engine claude --model claude-opus-5 --cwd ~/repo -- 'Review the diff.'
+agent-swarm spawn --name coder --engine codex --model gpt-6-astra --reasoning xhigh --cwd ~/repo -- 'Add auth tests. Commit. Do not push.'
+agent-swarm spawn --name reviewer --engine claude --model claude-opus-5-5 --cwd ~/repo -- 'Review the diff.'
 agent-swarm list
 agent-swarm log coder 120
 agent-swarm send coder 'Use option B and continue.'
