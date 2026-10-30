@@ -322,8 +322,13 @@ WORKTREE="$HOME/agent-worktrees/<task-slug>"   # persistent — never /tmp
 cd "$ROOT"
 git fetch --all --prune
 git status --short
+mkdir -p "$(dirname "$WORKTREE")"
 git worktree add -b "$BRANCH" "$WORKTREE" "$BASE"
 ```
+
+After merging a worker's branch, clean up with
+`git worktree remove "$WORKTREE"` so the home directory doesn't accumulate
+stale checkouts.
 
 If the main working tree is dirty, do not spawn a worker from it unless the user explicitly approves.
 
