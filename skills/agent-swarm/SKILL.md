@@ -66,23 +66,25 @@ Do not spawn workers for:
 - Multiple tasks that will edit the same files concurrently
 - Production/deploy actions unless the user explicitly asked and the repo runbook permits it
 
-Picking the right models for workflows and subagents
+## Picking models
+
 Rankings, higher = better. Cost reflects actual paid cost in practice, not list price. Intelligence is how hard a problem you can hand the model unsupervised. Taste covers UI/UX, code quality, API design, and copy.
 
-| model       | cost | intelligence | taste |
-|-------------|------|--------------|-------|
-| gpt-5.6-sol | 9    | 8            | 5     |
-| sonnet-5    | 5    | 5            | 7     |
-| opus-5      | 4    | 7            | 8     |
-| fable-5     | 2    | 9            | 9     |
+| model (CLI id)    | engine | cost | intelligence | taste |
+|-------------------|--------|------|--------------|-------|
+| `gpt-6-astra`     | codex  | 9    | 8            | 5     |
+| `claude-opus-5-5` | claude | 4    | 7            | 8     |
+| `claude-fable-5-1`| claude | 2    | 9            | 9     |
+
+The two workhorses are `gpt-6-astra` (Codex) and `claude-opus-5-5` (Claude). Fable is the escalation path, not a default.
 
 These are defaults, not limits. You have standing permission to override them: if a cheaper model's output does not meet the bar, rerun or redo with a smarter model without asking.
 Judge output quality, not price tags. Escalating is cheaper than shipping mediocre work.
 Cost is a tie-breaker only; when axes conflict for anything that ships: intelligence > taste > cost.
-Bulk/mechanical work (clear-spec implementation, data analysis, migrations): use gpt-5.6-sol.
-Anything user-facing (UI, copy, API design) needs taste >= 7.
-Reviews of plans/implementations: use fable-5 or opus-5; optionally add gpt-5.6-sol as an extra independent perspective.
-Never use Haiku or sonnet.
+Bulk/mechanical work (clear-spec implementation, data analysis, migrations): `gpt-6-astra`.
+Anything user-facing (UI, copy, API design) needs taste >= 7: `claude-opus-5-5`, or `claude-fable-5-1` when Opus falls short.
+Reviews of plans/implementations: `claude-opus-5-5` (or `claude-fable-5-1` for hard ones); optionally add `gpt-6-astra` as an extra independent perspective.
+Never use Haiku or Sonnet. Never use a previous generation (GPT-5.x, Opus 5, Fable 5): if the current model is unavailable, report the blocker instead of downgrading.
 
 ## First command
 
@@ -96,11 +98,11 @@ agent-swarm doctor
 
 ```bash
 # Hire a persistent Codex employee (live TUI in tmux — the default for coders)
-agent-swarm spawn --name coder --engine codex --mode interactive --model gpt-5.6-sol --reasoning xhigh --cwd "$PWD" -- \
+agent-swarm spawn --name coder --engine codex --mode interactive --model gpt-6-astra --reasoning xhigh --cwd "$PWD" -- \
   'Add missing auth tests. Follow AGENTS.md. Commit when done. Do not push.'
 
 # One-shot Claude worker in print mode (fire-and-forget tasks)
-agent-swarm spawn --name security-review --engine claude --model claude-opus-5 --cwd "$PWD" -- \
+agent-swarm spawn --name security-review --engine claude --model claude-opus-5-5 --cwd "$PWD" -- \
   'Review this codebase for security issues. Write findings to SECURITY_REVIEW.md.'
 
 # List all tracked workers
@@ -112,7 +114,7 @@ agent-swarm status coder
 # Read a worker (live TUI pane for interactive workers, log tail for exec)
 agent-swarm log coder 120
 
-# Is an interactive employee mid-task? ("busy" rc=0 / "idle" rc=1)
+# Is an interactive employee mid-task? ("busy" rc=0 / "idle" rc=1 / "blocked" rc=3)
 agent-swarm busy coder
 
 # Steer a live worker — queued behind the current turn if it is busy
@@ -183,26 +185,26 @@ its work is unrelated.
 
 ### Codex worker, default
 
-Explicitly pin every Codex worker to `gpt-5.6-sol` or `gpt-5.6-terra` with
-`--reasoning xhigh`. Default to `gpt-5.6-sol`; use `gpt-5.6-terra` when the user
-requests it or Sol is unavailable. Never use or fall back to `gpt-5.5`. If
-neither 5.6 model is available, report the blocker instead of downgrading. Do
-not resume a worker pinned to 5.5; remove it and spawn a 5.6 worker.
+Explicitly pin every Codex worker to `gpt-6-astra` with `--reasoning xhigh`.
+Do not resume a worker pinned to an older model (`agent-swarm status` shows the
+command); `rm` it and spawn a fresh `gpt-6-astra` worker.
 
 ```bash
 # persistent employee (default for implementation work)
-agent-swarm spawn --engine codex --mode interactive --model gpt-5.6-sol --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
+agent-swarm spawn --engine codex --mode interactive --model gpt-6-astra --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
 
 # fire-and-forget one-shot
-agent-swarm spawn --engine codex --model gpt-5.6-sol --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
+agent-swarm spawn --engine codex --model gpt-6-astra --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
 ```
 
 Commands inside tmux: interactive runs
-`codex -s workspace-write -a never --no-alt-screen -m gpt-5.6-sol -c
-model_reasoning_effort=xhigh '<prompt>'` (the TUI stays open between tasks; the
-runner pre-trusts the cwd so fresh worktrees don't block on the trust dialog);
-exec runs `codex exec --full-auto -m gpt-5.6-sol -c
-model_reasoning_effort=xhigh '<prompt>'`.
+`codex --no-alt-screen -c sandbox_mode=workspace-write -c approval_policy=never
+-m gpt-6-astra -c model_reasoning_effort=xhigh '<prompt>'` (the TUI stays open
+between tasks; the runner pre-trusts the cwd so fresh worktrees don't block on
+the trust dialog); exec runs `codex exec` with the same flags. Resumes
+(`codex resume` / `codex exec resume`) reuse them, so a recalled employee keeps
+its model and sandbox. The policy is passed via `-c` because Codex dropped
+`--full-auto` and `exec resume` accepts neither `-s` nor `-a`.
 
 Use Codex for implementation workers by default.
 Codex requires a git repo.
@@ -210,28 +212,32 @@ Codex requires a git repo.
 Options:
 
 ```bash
---no-full-auto         # no auto approval
---yolo                 # dangerous; only if user explicitly asks
---model gpt-5.6-sol    # or gpt-5.6-terra; reused when the worker is resumed
---reasoning xhigh      # reasoning effort: minimal|low|medium|high|xhigh
+--no-full-auto         # drop the workspace-write sandbox + never-ask policy (Codex defaults)
+--yolo                 # --dangerously-bypass-approvals-and-sandbox; only if user explicitly asks
+--model gpt-6-astra    # reused when the worker is resumed
+--reasoning xhigh      # model_reasoning_effort
 ```
 
 ### Claude worker
 
-Explicitly pin every Claude worker to `claude-opus-5`. Never use or fall back
-to Opus 4.8. If Opus 5 is unavailable, report the blocker instead of
-downgrading. Do not resume a worker pinned to 4.8; remove it and spawn an Opus
-5 worker.
+Explicitly pin every Claude worker to `claude-opus-5-5` (or `claude-fable-5-1`
+when escalating). Do not resume a worker pinned to an older model; `rm` it and
+spawn a fresh one.
 
 ```bash
-agent-swarm spawn --engine claude --model claude-opus-5 --name <name> --cwd <dir> -- '<prompt>'
+agent-swarm spawn --engine claude --model claude-opus-5-5 --name <name> --cwd <dir> -- '<prompt>'
 ```
 
 Default command inside tmux:
 
 ```bash
-claude -p --model claude-opus-5 '<prompt>' --max-turns 30
+claude -p --session-id <uuid> --permission-mode auto --model claude-opus-5-5 --max-turns 30 '<prompt>'
 ```
+
+`--permission-mode auto` is the default because plain `claude -p` declines file
+writes, so a reviewer told to write a report would silently fail. `--reasoning
+<level>` maps to Claude's `--effort` (low|medium|high|xhigh|max). `--dangerous`
+swaps in `--dangerously-skip-permissions`; only if the user explicitly asks.
 
 Use Claude for reviews, planning, architecture, and analysis-heavy tasks.
 Use `--mode interactive` only if a multi-turn TUI session is necessary.
@@ -308,7 +314,7 @@ For code-changing workers, prefer one git worktree per worker.
 volatile — it is wiped on reboot/crash and on session teardown. A worker mid-build
 with uncommitted edits there loses everything when the box restarts (this has
 already cost a 36-minute run). Use a persistent location like
-`/home/$USER/agent-worktrees/<task-slug>`. Worktree commits live in the main
+`$HOME/agent-worktrees/<task-slug>`. Worktree commits live in the main
 repo's shared `.git`, so committed work survives even if the worktree dir is
 later removed — but only if it was committed. Pair this with the commit-first
 rule below.
@@ -322,8 +328,13 @@ WORKTREE="$HOME/agent-worktrees/<task-slug>"   # persistent — never /tmp
 cd "$ROOT"
 git fetch --all --prune
 git status --short
+mkdir -p "$(dirname "$WORKTREE")"
 git worktree add -b "$BRANCH" "$WORKTREE" "$BASE"
 ```
+
+After merging a worker's branch, clean up with
+`git worktree remove "$WORKTREE"` so the home directory doesn't accumulate
+stale checkouts.
 
 If the main working tree is dirty, do not spawn a worker from it unless the user explicitly approves.
 
@@ -375,7 +386,7 @@ Keep prompts specific. A bad worker prompt creates chaos.
 Use `agent-swarm spawn`, not raw tmux, unless the script is missing.
 
 ```bash
-agent-swarm spawn --name <name> --engine codex --mode interactive --model gpt-5.6-sol --reasoning xhigh --cwd <worktree> -- '<prompt>'
+agent-swarm spawn --name <name> --engine codex --mode interactive --model gpt-6-astra --reasoning xhigh --cwd <worktree> -- '<prompt>'
 ```
 
 For many workers, spawn at most 4 concurrently unless the user overrides.
@@ -396,6 +407,11 @@ agent-swarm send <name> '<answer>'
 ```
 
 If the question changes scope or risk, ask the user.
+
+`busy`/`wait` report `blocked` when an interactive TUI is parked on a modal
+(for example Codex's "Hooks need review" prompt after hooks change, or an
+approval dialog). Read it with `agent-swarm log <name>` and ask the user. Never
+trust hooks or approve on the user's behalf.
 
 ### 7. Review outputs before reporting success
 

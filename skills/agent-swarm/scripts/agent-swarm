@@ -38,10 +38,10 @@ Spawn options:
   --prompt-file FILE      Read prompt from file
   --cmd COMMAND           For --engine shell only: shell command to run
   --model NAME            Codex/Claude model id; reused on resume
-  --reasoning EFFORT      Codex reasoning effort (minimal|low|medium|high|xhigh)
-  --no-full-auto          Codex exec without --full-auto
-  --yolo                  Codex exec with --yolo instead of --full-auto
-  --dangerous             Claude interactive with --dangerously-skip-permissions
+  --reasoning EFFORT      Codex model_reasoning_effort / Claude --effort (e.g. xhigh)
+  --no-full-auto          Codex without the workspace-write sandbox + never-ask policy
+  --yolo                  Codex with --dangerously-bypass-approvals-and-sandbox
+  --dangerous             Claude with --dangerously-skip-permissions (default: --permission-mode auto)
   --max-turns N           Claude print-mode max turns (default: 30)
   --detach-only           Create tracker + tmux session, do not wait (default)
 
@@ -64,9 +64,9 @@ Persistent employees:
   before.
 
 Examples:
-  agent-swarm spawn --name api-tests --engine codex --model gpt-5.6-sol --reasoning xhigh --cwd ~/repo -- 'Add tests for auth service. Commit when done.'
-  agent-swarm spawn --name coder --engine codex --model gpt-5.6-terra --reasoning xhigh --cwd ~/repo -- 'Implement feature X.'
-  agent-swarm spawn --name review --engine claude --model claude-opus-5 --cwd ~/repo -- 'Review this repo for security issues.'
+  agent-swarm spawn --name api-tests --engine codex --model gpt-6-astra --reasoning xhigh --cwd ~/repo -- 'Add tests for auth service. Commit when done.'
+  agent-swarm spawn --name coder --engine codex --mode interactive --model gpt-6-astra --reasoning xhigh --cwd ~/repo -- 'Implement feature X.'
+  agent-swarm spawn --name review --engine claude --model claude-opus-5-5 --cwd ~/repo -- 'Review this repo for security issues.'
   agent-swarm list
   agent-swarm log api-tests 120
   agent-swarm send api-tests 'Yes, proceed with option A.'
@@ -145,6 +145,14 @@ type_into_session() {
   tmux send-keys -t "$session" Enter
 }
 
+# Is a live TUI parked on a modal that needs a human (codex hook-trust review,
+# approval prompts)? The composer glyph stays visible behind the modal, so
+# without this check such a worker reads as idle and `wait` calls it done.
+# ponytail: matches codex 0.155's modal footer; extend if claude's differs.
+session_blocked() {
+  tmux capture-pane -t "$1" -p 2>/dev/null | grep -qi 'press enter to confirm'
+}
+
 # Is a live interactive worker mid-task? Busy iff its pane shows the engine's
 # "esc to interrupt" spinner; a rendered composer with no spinner is idle.
 # ponytail: verified against codex TUI 0.142; composer regex may need extending
@@ -153,6 +161,7 @@ session_busy() {
   local session="$1" pane
   tmux_alive "$session" || return 1
   pane="$(tmux capture-pane -t "$session" -p 2>/dev/null)"
+  if session_blocked "$session"; then return 1; fi
   if grep -qi 'esc to interrupt' <<<"$pane"; then return 0; fi
   if grep -qE '[›❯]' <<<"$pane"; then return 1; fi
   return 0
@@ -248,7 +257,7 @@ CODEX_SESSIONS="${CODEX_HOME:-$HOME/.codex}/sessions"
 (
   for __i in $(seq 1 45); do
     sleep 2
-    __f="$(find "$CODEX_SESSIONS" -name '*.jsonl' -newer "$__mark" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2- | while IFS= read -r __r; do
+    __f="$(find "$CODEX_SESSIONS" -name '*.jsonl' -newer "$__mark" -exec ls -t {} + 2>/dev/null | while IFS= read -r __r; do
       head -c 4096 "$__r" 2>/dev/null | grep -qF "\"cwd\":\"$PWD\"" && { printf '%s\n' "$__r"; break; }
     done)"
     if [ -n "$__f" ]; then
@@ -271,7 +280,7 @@ PRETRUST
 # so the worker can be resumed later. UUID-from-rollout heuristic — verify the
 # rollout path/format against your codex version; if it changes, fix this block.
 CODEX_SESSIONS="${CODEX_HOME:-$HOME/.codex}/sessions"
-__newest="$(find "$CODEX_SESSIONS" -name '*.jsonl' -newer "$__mark" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)"
+__newest="$(find "$CODEX_SESSIONS" -name '*.jsonl' -newer "$__mark" -exec ls -t {} + 2>/dev/null | head -n1)"
 if [ -n "$__newest" ]; then
   __sid="$(basename "$__newest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n1)"
   [ -z "$__sid" ] && __sid="$(grep -ohE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$__newest" 2>/dev/null | head -n1)"
@@ -285,17 +294,14 @@ CAP
 
 # Build the engine command line for spawn/assign. Sets the global `CMDLINE`,
 # `COMMAND_TEXT`, and `CAPTURE_CODEX`. `$PROMPT` is kept literal for the runner.
+# codex_flags/claude_flags carry model + permission policy and are persisted per
+# agent, so a resumed worker runs under the same policy it was hired with.
 build_cmdline() {
-  local engine="$1" mode="$2" resume_sid="$3" codex_auto="$4" codex_flags="$5" \
-        claude_danger="$6" claude_flags="$7" max_turns="$8" session_id="$9" shell_cmd="${10}"
+  local engine="$1" mode="$2" resume_sid="$3" codex_flags="$4" \
+        claude_flags="$5" max_turns="$6" session_id="$7" shell_cmd="$8"
   CAPTURE_CODEX=0
-  # The TUI rejects exec's --full-auto/--yolo aliases (codex >= 0.142); translate.
   # --no-alt-screen keeps output linear so tmux scrollback/capture-pane stay readable.
   local tui_flags="--no-alt-screen"
-  case "$codex_auto" in
-    --full-auto) tui_flags="-s workspace-write -a never --no-alt-screen" ;;
-    --yolo)      tui_flags="--dangerously-bypass-approvals-and-sandbox --no-alt-screen" ;;
-  esac
   case "$engine:$mode" in
     codex:interactive)
       if [[ -n "$resume_sid" ]]; then
@@ -313,18 +319,18 @@ build_cmdline() {
         CMDLINE="codex exec resume $resume_sid${codex_flags:+ $codex_flags} \"\$PROMPT\""
         COMMAND_TEXT="codex exec resume $resume_sid $codex_flags <prompt>"
       else
-        CMDLINE="codex exec${codex_auto:+ $codex_auto}${codex_flags:+ $codex_flags} \"\$PROMPT\""
-        COMMAND_TEXT="codex exec $codex_auto $codex_flags <prompt>"
+        CMDLINE="codex exec${codex_flags:+ $codex_flags} \"\$PROMPT\""
+        COMMAND_TEXT="codex exec $codex_flags <prompt>"
         CAPTURE_CODEX=1
       fi
       ;;
     claude:interactive)
       if [[ -n "$resume_sid" ]]; then
-        CMDLINE="claude --resume $resume_sid${claude_danger:+ $claude_danger}${claude_flags:+ $claude_flags} \"\$PROMPT\""
+        CMDLINE="claude --resume $resume_sid${claude_flags:+ $claude_flags} \"\$PROMPT\""
         COMMAND_TEXT="claude --resume $resume_sid $claude_flags <prompt>"
       else
-        CMDLINE="claude --session-id $session_id${claude_danger:+ $claude_danger}${claude_flags:+ $claude_flags} \"\$PROMPT\""
-        COMMAND_TEXT="claude --session-id $session_id $claude_danger $claude_flags <prompt>"
+        CMDLINE="claude --session-id $session_id${claude_flags:+ $claude_flags} \"\$PROMPT\""
+        COMMAND_TEXT="claude --session-id $session_id $claude_flags <prompt>"
       fi
       ;;
     claude:*)
@@ -357,7 +363,11 @@ cmd_spawn() {
   require_tmux
 
   local name="" engine="codex" cwd="$PWD" mode="exec" prompt="" prompt_file="" shell_cmd=""
-  local codex_auto="--full-auto" claude_danger="" max_turns="30" model="" reasoning=""
+  # Unattended defaults. codex >= 0.15x dropped --full-auto, and `exec resume`
+  # takes neither -s nor -a, so the policy goes through -c (every subcommand
+  # accepts it). Claude -p denies file writes unless a permission mode allows them.
+  local codex_auto="-c sandbox_mode=workspace-write -c approval_policy=never"
+  local claude_perm="--permission-mode auto" max_turns="30" model="" reasoning=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -371,8 +381,8 @@ cmd_spawn() {
       --model) need_val "$@"; model="$2"; shift 2 ;;
       --reasoning) need_val "$@"; reasoning="$2"; shift 2 ;;
       --no-full-auto) codex_auto=""; shift ;;
-      --yolo) codex_auto="--yolo"; shift ;;
-      --dangerous) claude_danger="--dangerously-skip-permissions"; shift ;;
+      --yolo) codex_auto="--dangerously-bypass-approvals-and-sandbox"; shift ;;
+      --dangerous) claude_perm="--dangerously-skip-permissions"; shift ;;
       --max-turns) need_val "$@"; max_turns="$2"; shift 2 ;;
       --detach-only) shift ;;
       --help|-h) usage; exit 0 ;;
@@ -384,7 +394,9 @@ cmd_spawn() {
   case "$engine" in codex|claude|hermes|shell) ;; *) echo "ERROR: unsupported engine: $engine" >&2; exit 1 ;; esac
   case "$mode" in exec|interactive) ;; *) echo "ERROR: unsupported mode: $mode" >&2; exit 1 ;; esac
 
-  cwd="$(cd "$cwd" && pwd)"
+  # Physical path: codex records the resolved cwd in its rollout (/private/var on
+  # macOS), and the interactive session-id capture matches on it.
+  cwd="$(cd "$cwd" && pwd -P)"
   local id created updated safe_name session agent_dir log_file runner exit_file sid_file
   id="$(new_id)"
   name="${name:-$engine-$id}"
@@ -409,15 +421,18 @@ cmd_spawn() {
     printf '%s\n' "$prompt" > "$prompt_file"
   fi
 
-  # Keep model flags across resumes
+  # Keep model + permission flags across resumes
   local codex_flags="" claude_flags=""
   if [[ "$engine" == codex ]]; then
+    codex_flags="$codex_auto"
     [[ -n "$model" ]] && codex_flags+=" -m $model"
     [[ -n "$reasoning" ]] && codex_flags+=" -c model_reasoning_effort=$reasoning"
     codex_flags="${codex_flags# }"
     printf '%s\n' "$codex_flags" > "$agent_dir/codex_flags"
   elif [[ "$engine" == claude ]]; then
-    [[ -n "$model" ]] && claude_flags="--model $model"
+    claude_flags="$claude_perm"
+    [[ -n "$model" ]] && claude_flags+=" --model $model"
+    [[ -n "$reasoning" ]] && claude_flags+=" --effort $reasoning"
     printf '%s\n' "$claude_flags" > "$agent_dir/claude_flags"
   fi
 
@@ -426,7 +441,7 @@ cmd_spawn() {
   [[ "$engine" == claude ]] && session_id="$(gen_uuid)"
 
   local interactive=0; [[ "$mode" == interactive ]] && interactive=1
-  build_cmdline "$engine" "$mode" "" "$codex_auto" "$codex_flags" "$claude_danger" "$claude_flags" "$max_turns" "$session_id" "$shell_cmd"
+  build_cmdline "$engine" "$mode" "" "$codex_flags" "$claude_flags" "$max_turns" "$session_id" "$shell_cmd"
   build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_file" "$sid_file" "$CAPTURE_CODEX" "$interactive" "$CMDLINE"
 
   tmux new-session -d -s "$session" -x 140 -y 40 "$runner"
@@ -502,7 +517,7 @@ cmd_assign() {
     echo "WARN: no session id stored for $id; starting fresh (prior context not restored)" >&2
   fi
   local interactive=0; [[ "$mode" == interactive ]] && interactive=1
-  build_cmdline "$engine" "$mode" "$sid" "--full-auto" "$codex_flags" "" "$claude_flags" "30" "" ""
+  build_cmdline "$engine" "$mode" "$sid" "$codex_flags" "$claude_flags" "30" "" ""
   build_runner "$runner" "$log_file" "$exit_file" "$cwd" "$prompt_path" "$sid_file" "$CAPTURE_CODEX" "$interactive" "$CMDLINE"
 
   tmux new-session -d -s "$new_session" -x 140 -y 40 "$runner"
@@ -595,12 +610,14 @@ cmd_interrupt() {
 }
 
 # busy <ref>: exit 0 + "busy" if a live interactive worker is mid-task,
-# exit 1 + "idle" if it's waiting at the composer, exit 2 if not running.
+# exit 1 + "idle" if it's waiting at the composer, exit 2 if not running,
+# exit 3 + "blocked" if it's stuck on a modal that needs a human.
 cmd_busy() {
   local id session
   id=$(resolve_ref "$1")
   session=$(field "$id" 6)
   tmux_alive "$session" || { echo "not-running"; return 2; }
+  if session_blocked "$session"; then echo "blocked"; return 3; fi
   if session_busy "$session"; then echo "busy"; else echo "idle"; return 1; fi
 }
 
@@ -683,9 +700,11 @@ cmd_wait() {
   for id in "${ids[@]}"; do
     st=$(agent_runtime_status "$id")
     rewrite_status "$id" "$st"
-    # Report a live-but-idle employee as done ("idle"), not still-running.
-    if [[ "$st" == "running" && "$(field "$id" 5)" == interactive ]] && ! session_busy "$(field "$id" 6)"; then
-      st="idle"
+    # Report a live-but-idle employee as done ("idle"), not still-running; one
+    # parked on a modal is "blocked" and counts as a failure so it gets looked at.
+    if [[ "$st" == "running" && "$(field "$id" 5)" == interactive ]]; then
+      if session_blocked "$(field "$id" 6)"; then st="blocked"
+      elif ! session_busy "$(field "$id" 6)"; then st="idle"; fi
     fi
     name=$(field "$id" 2)
     exit_file="$RUN_DIR/$id/exit_code"; ec="?"
@@ -694,7 +713,7 @@ cmd_wait() {
     # `exited` = tmux gone with no exit_code file (worker killed before its trap ran:
     # SIGKILL/OOM/host stop). Outcome unknown → treat as failure so the orchestrator
     # never reads a dead worker as a clean finish.
-    if [[ "$st" == "running" || "$st" == "failed" || "$st" == "exited" ]]; then rc=1; fi
+    if [[ "$st" == "running" || "$st" == "failed" || "$st" == "exited" || "$st" == "blocked" ]]; then rc=1; fi
   done
   return "$rc"
 }
@@ -734,10 +753,10 @@ cmd_selftest() {
   # has-session fails so the dead worker stays dead
   mkdir -p "$home/bin"
   printf '#!/usr/bin/env bash\n[ "$1" = has-session ] && exit 1\nexit 0\n' > "$home/bin/tmux"; chmod +x "$home/bin/tmux"
-  printf '%s\n' '--model claude-opus-5' > "$home/runs/AID2/claude_flags"
+  printf '%s\n' '--permission-mode auto --model claude-opus-5-5' > "$home/runs/AID2/claude_flags"
   AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" assign emp -- 'next task' >/dev/null 2>&1 || true
   if grep -q -- '--resume abc-123-uuid' "$home/runs/AID2/run.sh" 2>/dev/null &&
-     grep -q -- '--model claude-opus-5' "$home/runs/AID2/run.sh" 2>/dev/null; then :; else
+     grep -q -- '--model claude-opus-5-5' "$home/runs/AID2/run.sh" 2>/dev/null; then :; else
     echo "FAIL: assign lost Claude session or model"; fail=1
   fi
   grep -q 'tee -a' "$home/runs/AID2/run.sh" 2>/dev/null || { echo "FAIL: exec runner lost its tee redirect"; fail=1; }
@@ -749,6 +768,16 @@ cmd_selftest() {
   AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" assign tuiemp -- 'next task' >/dev/null 2>&1 || true
   grep -q 'codex resume cdx-uuid-333' "$home/runs/AID3/run.sh" 2>/dev/null || { echo "FAIL: interactive assign did not build a TUI resume runner"; fail=1; }
   grep -q 'tee -a' "$home/runs/AID3/run.sh" 2>/dev/null && { echo "FAIL: interactive runner must not tee (breaks the TUI)"; fail=1; }
+
+  # Fresh spawns must only use flags current CLIs accept: codex dropped
+  # --full-auto/--yolo, macOS find has no -printf, claude -p needs a write policy.
+  AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" spawn --name sx --engine codex --cwd "$home" -- 'x' >/dev/null 2>&1 || true
+  AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" spawn --name si --engine codex --mode interactive --cwd "$home" -- 'x' >/dev/null 2>&1 || true
+  AGENT_SWARM_HOME="$home" PATH="$home/bin:$PATH" "$self" spawn --name sc --engine claude --cwd "$home" -- 'x' >/dev/null 2>&1 || true
+  local runs; runs="$(cat "$home"/runs/*/run.sh 2>/dev/null)"
+  grep -qE -- '--full-auto|--yolo|-printf' <<<"$runs" && { echo "FAIL: runner uses a removed/non-portable flag"; fail=1; }
+  [[ "$(grep -c 'sandbox_mode=workspace-write' <<<"$runs")" -ge 2 ]] || { echo "FAIL: codex spawn lost its sandbox policy"; fail=1; }
+  grep -q -- 'claude -p --session-id .* --permission-mode auto' <<<"$runs" || { echo "FAIL: claude spawn lost --permission-mode auto"; fail=1; }
 
   # resolve_ref must return the NEWEST row when a name is reused across rounds.
   printf 'OLD1\tfam\tcodex\t/tmp\texec\ts1\tstopped\t2026-01-01T00:00:00Z\t2026-01-01T00:00:00Z\t\t\tcodex\n' >> "$sf"
