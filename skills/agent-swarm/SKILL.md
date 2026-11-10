@@ -38,7 +38,8 @@ saved session carries the context, so workers survive reboots.
 ```bash
 # Give a task. Hires `coder` if the name is new, otherwise continues its conversation
 agent-swarm run coder --worktree -- 'Add auth tests for src/auth.ts. Run npm test.'
-agent-swarm run reviewer --engine claude -- 'Review the diff in ~/.agent-swarm/worktrees/repo-coder against the spec in docs/auth.md.'
+# A reviewer works inside the tree it reviews, so point it there
+agent-swarm run reviewer --engine claude --cwd ~/.agent-swarm/worktrees/repo-coder -- 'Review the uncommitted diff against docs/auth.md. Do not edit anything.'
 
 # Block until they finish. Prints every new reply and the files each worker left uncommitted
 agent-swarm wait
@@ -64,10 +65,13 @@ agent-swarm rm coder        # stop it and forget it
 - **To steer a worker mid-task,** `stop` it and `run` the correction. Its
   conversation is kept, so it knows what it was doing.
 - **`wait` blocks.** Run it in the background if your harness supports that, so
-  you are woken when it exits. With no names it waits for every busy worker.
-  Exit code 0 = all finished ok, 1 = a turn failed, 124 = `--timeout S` hit.
-- **Names belong to a project.** The same name from another repo is refused, so
-  pick names that say the job: `auth-coder`, `api-reviewer`.
+  you are woken when it exits. With no names it covers every worker of this
+  project that is busy or has a reply you have not seen. Exit code 0 = every
+  turn finished ok, 1 = one failed, was stopped or died, 124 = `--timeout S` hit.
+  On a timeout it prints only what is new, never an older reply.
+- **Names belong to a project** (a git repo and its worktrees). Call
+  `agent-swarm` from inside that project; the same name from another repo is
+  refused. Pick names that say the job: `auth-coder`, `api-reviewer`.
 
 `agent-swarm` needs to run outside any sandbox your own harness applies, since
 it starts worker processes and writes `~/.agent-swarm`.
@@ -171,8 +175,8 @@ Once the user agrees, that roster IS the team for the rest of the
 conversation. Five turns later, a new implementation task goes to `auth-coder`
 with `run`, not to a new name. Hire a new worker only when the task is in a
 different repo, you need parallelism the team can't give, or a worker's
-conversation has grown so large it is degrading (then `rm` it, hire again, and
-say so).
+conversation has grown so large it is degrading (then `rm` it, hire it again
+under the same name, and say so).
 
 Keep at most 4 workers busy at once unless the user overrides.
 
@@ -181,7 +185,8 @@ Keep at most 4 workers busy at once unless the user overrides.
 `--worktree` gives the worker its own git worktree at
 `~/.agent-swarm/worktrees/<repo>-<name>` on a new branch `agent/<name>`, cut from
 your current HEAD. Use it whenever more than one worker changes code, so they
-never share a working tree. Uncommitted changes in your own checkout are not in
+never share a working tree. It only works when hiring: an existing worker
+without a worktree refuses the flag. Uncommitted changes in your own checkout are not in
 the worktree, and `run` says so when that applies; if the main tree is dirty, do
 not hire from it unless the user approves.
 
@@ -192,7 +197,10 @@ git worktree remove ~/.agent-swarm/worktrees/<repo>-<name>
 git branch -d agent/<name>
 ```
 
-`rm` forgets the worker but leaves its worktree and branch alone.
+`rm` forgets the worker but leaves its worktree and branch alone. Hire the same
+name again with `--worktree` and it gets that worktree back, with a fresh
+conversation. That is how you replace a worker whose conversation has degraded
+without losing its work.
 
 ### 4. Write the task
 

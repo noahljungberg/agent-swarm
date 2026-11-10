@@ -53,6 +53,7 @@ agent-swarm rm coder
 ```
 
 - `run` hires the worker if the name is new, otherwise continues its conversation.
+  A name belongs to the git repo it was hired in.
   A task for a busy worker queues behind its current turn.
 - Codex workers default to `gpt-6-astra` at `xhigh`, Claude workers to
   `claude-opus-5-5`. The defaults live in `src/engines/index.ts`.

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
-import { EngineError, SessionLostError, type TurnRequest, type TurnResult } from './types.ts';
+import { SessionLostError, type TurnRequest } from './types.ts';
 
 type Json = Record<string, any>;
 
@@ -11,7 +11,7 @@ function toolLine(name: string, input: Json): string {
 }
 
 // One `claude -p` per turn. The conversation lives in claude's own store, --resume picks it up
-export function claudeTurn(req: TurnRequest): Promise<TurnResult> {
+export function claudeTurn(req: TurnRequest): Promise<string> {
   const fresh = req.session === null;
   const session = req.session ?? randomUUID();
   const args = [
@@ -40,15 +40,12 @@ export function claudeTurn(req: TurnRequest): Promise<TurnResult> {
       }
     });
     createInterface({ input: child.stderr }).on('line', (line) => { if (line.trim()) tail = line; });
-    child.on('error', (err) => reject(new EngineError(`can't run claude: ${err.message}`)));
+    child.on('error', (err) => reject(new Error(`can't run claude: ${err.message}`)));
     child.on('close', (code) => {
-      if (result && !result['is_error']) {
-        resolve({ session: String(result['session_id'] ?? session), reply: String(result['result'] ?? '') });
-        return;
-      }
+      if (result && !result['is_error']) { resolve(String(result['result'] ?? '')); return; }
       // a failed --resume reports in `errors`, not `result`
       const message = [result?.['result'], ...(result?.['errors'] ?? [])].filter(Boolean).join(' ') || tail || `claude exited ${code}`;
-      reject(!fresh && /no conversation found/i.test(message) ? new SessionLostError(message) : new EngineError(message));
+      reject(!fresh && /no conversation found/i.test(message) ? new SessionLostError(message) : new Error(message));
     });
   });
 }

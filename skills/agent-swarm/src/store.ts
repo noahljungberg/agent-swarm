@@ -8,7 +8,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -98,21 +98,33 @@ export function clearQueue(name: string): void {
 
 // --- runner lock ---
 
-// Pid of the live runner, or null. Checks the command too, a stale pid can get reused by something else
+// Pid of the live runner, or null
 export function runnerPid(name: string): number | null {
   const pid = Number(readJson<number>(path(name, 'pid')));
   if (!pid) return null;
+  try { process.kill(pid, 0); } catch { return null; }  // signal 0 = just ask if it exists
+  // alive, but a stale pid can get reused by something else, so check its command line.
+  // -ww: linux ps cuts the line at COLUMNS otherwise and the name falls off
   try {
-    const command = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    return command.includes(`_work ${name}`) ? pid : null;
-  } catch { return null; }
+    const command = execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return command.trimEnd().endsWith(`_work ${name}`) ? pid : null;
+  } catch { return pid; }  // no usable ps -> trust the pid, calling a live runner dead starts a second one
 }
 
-// ponytail: clearing a stale lock isn't atomic, two runners starting right after a crashed one could both win.
-// needs a kill -9 plus a same-ms double start, use flock if it ever shows up
+// hard link = the pid file appears whole or not at all, and fails if one is already there
+function takeLock(name: string): boolean {
+  const tmp = path(name, `pid.${process.pid}.tmp`);
+  writeFileSync(tmp, String(process.pid));
+  try { linkSync(tmp, path(name, 'pid')); return true; } catch { return false; } finally { rmSync(tmp); }
+}
+
+// ponytail: stealing a stale lock isn't atomic. After a kill -9, two runners starting in the same instant
+// could both take it. use flock if that ever shows up
 export function lock(name: string): boolean {
-  if (runnerPid(name) === null) rmSync(path(name, 'pid'), { force: true });
-  try { writeFileSync(path(name, 'pid'), String(process.pid), { flag: 'wx' }); return true; } catch { return false; }
+  if (takeLock(name)) return true;
+  if (runnerPid(name) !== null) return false;
+  rmSync(path(name, 'pid'), { force: true });  // left behind by a runner that died
+  return takeLock(name);
 }
 export const unlock = (name: string) => rmSync(path(name, 'pid'), { force: true });
 

@@ -11,15 +11,8 @@ export interface TurnRequest {
   onLog(line: string): void;    // one line per thing the worker did
 }
 
-export interface TurnResult {
-  session: string;
-  reply: string;
-}
-
-// One turn = one engine process. It resumes req.session, runs the prompt, exits
-export type Engine = (req: TurnRequest) => Promise<TurnResult>;
-
-export class EngineError extends Error {}
+// One turn = one engine process. It resumes req.session, runs the prompt, exits. Resolves with the reply
+export type Engine = (req: TurnRequest) => Promise<string>;
 
 // The engine no longer has the saved session (pruned transcript, wiped home) -> caller starts over fresh
-export class SessionLostError extends EngineError {}
+export class SessionLostError extends Error {}

@@ -31,12 +31,12 @@ async function runTurn(name: string, task: string): Promise<void> {
   });
   try {
     let lost = '';
-    const result = await attempt(worker.session).catch((err) => {
+    const reply = await attempt(worker.session).catch((err) => {
       if (!(err instanceof SessionLostError)) throw err;
       lost = '(this worker\'s earlier conversation is gone, it started fresh without that context)\n';
       return attempt(null);
     });
-    endTurn(name, turn, { ok: true, reply: lost + result.reply });
+    endTurn(name, turn, { ok: true, reply: lost + reply });
   } catch (err) {
     endTurn(name, turn, { ok: false, error: (err as Error).message });
   }

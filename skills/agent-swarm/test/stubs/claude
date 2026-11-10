@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Fake `claude -p`. Sessions are files under FAKE_ENGINE_HOME, the reply says which turn of the session it is.
-// Prompt directives: "sleep <ms>", "FAIL", "touch <file>"
+// Prompt directives: "sleep <ms>", "FAIL", "touch <file>", "stubborn <file>"
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -25,6 +26,9 @@ out({ type: 'system', subtype: 'init', session_id: id });
 out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }] } });
 const touch = /touch (\S+)/.exec(prompt)?.[1];
 if (touch) writeFileSync(touch, 'hi');
+// a tool child that ignores TERM, then writes a file late
+const stubborn = /stubborn (\S+)/.exec(prompt)?.[1];
+if (stubborn) spawn('sh', ['-c', `trap "" TERM; sleep 4; echo late > ${stubborn}`], { stdio: 'ignore' });
 setTimeout(() => {
   if (prompt.includes('FAIL')) { out({ type: 'result', is_error: true, result: 'boom' }); process.exit(1); }
   out({ type: 'result', is_error: false, session_id: id, result: `turn ${turn}: ${prompt}` });

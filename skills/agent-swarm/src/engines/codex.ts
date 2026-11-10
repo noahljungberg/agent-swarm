@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { EngineError, SessionLostError, type TurnRequest, type TurnResult } from './types.ts';
+import { SessionLostError, type TurnRequest } from './types.ts';
 
 type Json = Record<string, any>;
 
@@ -9,10 +9,13 @@ class Rpc {
   private nextId = 0;
   private waiting = new Map<number, { resolve: (v: Json) => void; reject: (e: Error) => void }>();
   private child: ChildProcess;
+  exited: Error | null = null;
   onNotify: (method: string, params: Json) => void = () => {};
 
   constructor(child: ChildProcess) {
     this.child = child;
+    let tail = '';  // last stderr line, the only place codex says why it quit (not logged in, bad config)
+    createInterface({ input: child.stderr! }).on('line', (line) => { if (line.trim()) tail = line.trim(); });
     createInterface({ input: child.stdout! }).on('line', (line) => {
       let msg: Json;
       try { msg = JSON.parse(line) as Json; } catch { return; }
@@ -28,12 +31,13 @@ class Rpc {
         const waiter = this.waiting.get(msg['id'] as number);
         if (!waiter) return;
         this.waiting.delete(msg['id'] as number);
-        if (msg['error']) waiter.reject(new EngineError(String(msg['error'].message ?? JSON.stringify(msg['error']))));
+        if (msg['error']) waiter.reject(new Error(String(msg['error'].message ?? JSON.stringify(msg['error']))));
         else waiter.resolve((msg['result'] as Json) ?? {});
       }
     });
     child.on('close', () => {
-      for (const w of this.waiting.values()) w.reject(new EngineError('codex app-server exited'));
+      this.exited = new Error(`codex app-server exited${tail ? `: ${tail}` : ''}`);
+      for (const w of this.waiting.values()) w.reject(this.exited);
       this.waiting.clear();
       this.onNotify('_exit', {});
     });
@@ -42,6 +46,7 @@ class Rpc {
   send(msg: Json): void { this.child.stdin!.write(`${JSON.stringify(msg)}\n`); }
 
   request(method: string, params: Json = {}): Promise<Json> {
+    if (this.exited) return Promise.reject(this.exited);  // nobody left to answer, dont hang
     const id = ++this.nextId;
     return new Promise((resolve, reject) => {
       this.waiting.set(id, { resolve, reject });
@@ -63,9 +68,9 @@ async function runTurn(rpc: Rpc, threadId: string, req: TurnRequest): Promise<st
       } else if (method === 'turn/completed') {
         const turn = (params['turn'] ?? {}) as Json;
         if (turn['status'] === 'completed') resolve(reply);
-        else reject(new EngineError(`codex turn ${turn['status']}: ${turn['error']?.message ?? JSON.stringify(turn['error'] ?? {})}`));
-      } else if (method === 'error' && !params['willRetry']) reject(new EngineError(String(params['error']?.message ?? 'codex error')));
-      else if (method === '_exit') reject(new EngineError('codex app-server exited mid-turn'));
+        else reject(new Error(`codex turn ${turn['status']}: ${turn['error']?.message ?? JSON.stringify(turn['error'] ?? {})}`));
+      } else if (method === 'error' && !params['willRetry']) reject(new Error(String(params['error']?.message ?? 'codex error')));
+      else if (method === '_exit') reject(rpc.exited!);
     };
   });
   done.catch(() => {});  // if turn/start itself fails that error is the one thrown, this one must not go unhandled
@@ -74,11 +79,11 @@ async function runTurn(rpc: Rpc, threadId: string, req: TurnRequest): Promise<st
 }
 
 // One `codex app-server` per turn: thread/resume picks the conversation up, and a fresh process can't carry stale state
-export async function codexTurn(req: TurnRequest): Promise<TurnResult> {
-  const child = spawn('codex', ['app-server'], { cwd: req.cwd, stdio: ['pipe', 'pipe', 'ignore'] });
+export async function codexTurn(req: TurnRequest): Promise<string> {
+  const child = spawn('codex', ['app-server'], { cwd: req.cwd, stdio: ['pipe', 'pipe', 'pipe'] });
   await new Promise<void>((resolve, reject) => {
     child.once('spawn', resolve);
-    child.once('error', (err) => reject(new EngineError(`can't run codex: ${err.message}`)));
+    child.once('error', (err) => reject(new Error(`can't run codex: ${err.message}`)));
   });
   const rpc = new Rpc(child);
   try {
@@ -96,7 +101,7 @@ export async function codexTurn(req: TurnRequest): Promise<TurnResult> {
     }
     const threadId = String(started['thread']?.id);
     req.onSession(threadId);
-    return { session: threadId, reply: await runTurn(rpc, threadId, req) };
+    return await runTurn(rpc, threadId, req);
   } finally {
     child.kill();
   }
