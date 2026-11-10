@@ -1,0 +1,38 @@
+#!/usr/bin/env node
+// Fake `codex app-server`: the JSON-RPC subset agent-swarm speaks. Same sessions and directives as the fake claude
+import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+
+if (process.argv[2] !== 'app-server') process.exit(2);
+const home = process.env.FAKE_ENGINE_HOME;
+const file = (id) => join(home, `codex-${id}`);
+const send = (msg) => console.log(JSON.stringify(msg));
+
+createInterface({ input: process.stdin }).on('line', (line) => {
+  const { id, method, params } = JSON.parse(line);
+  if (method === 'initialize') send({ id, result: {} });
+  else if (method === 'thread/start') {
+    const thread = randomUUID();
+    writeFileSync(file(thread), '0');
+    writeFileSync(join(home, 'codex-args.json'), JSON.stringify(params));
+    send({ id, result: { thread: { id: thread } } });
+  } else if (method === 'thread/resume') {
+    if (existsSync(file(params.threadId))) send({ id, result: { thread: { id: params.threadId } } });
+    else send({ id, error: { code: -32600, message: `no rollout found for thread id ${params.threadId}` } });
+  } else if (method === 'turn/start') {
+    const prompt = params.input[0].text.trim();
+    const turn = Number(readFileSync(file(params.threadId), 'utf8')) + 1;
+    writeFileSync(file(params.threadId), String(turn));
+    send({ id, result: { turn: { id: 't' } } });
+    send({ method: 'item/completed', params: { item: { type: 'commandExecution', command: 'echo hi', exitCode: 0 } } });
+    const touch = /touch (\S+)/.exec(prompt)?.[1];
+    if (touch) writeFileSync(touch, 'hi');
+    setTimeout(() => {
+      if (prompt.includes('FAIL')) { send({ method: 'turn/completed', params: { turn: { status: 'failed', error: { message: 'boom' } } } }); return; }
+      send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: `turn ${turn}: ${prompt}` } } });
+      send({ method: 'turn/completed', params: { turn: { status: 'completed' } } });
+    }, Number(/sleep (\d+)/.exec(prompt)?.[1] ?? 0));
+  }
+});

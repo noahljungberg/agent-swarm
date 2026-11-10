@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+// Fake `claude -p`. Sessions are files under FAKE_ENGINE_HOME, the reply says which turn of the session it is.
+// Prompt directives: "sleep <ms>", "FAIL", "touch <file>"
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const args = process.argv.slice(2);
+const arg = (flag) => (args.includes(flag) ? args[args.indexOf(flag) + 1] : null);
+const home = process.env.FAKE_ENGINE_HOME;
+const prompt = readFileSync(0, 'utf8').trim();
+const out = (event) => console.log(JSON.stringify(event));
+
+const resume = arg('--resume');
+const id = resume ?? arg('--session-id');
+const file = join(home, `claude-${id}`);
+if (resume && !existsSync(file)) {
+  out({ type: 'result', is_error: true, errors: [`No conversation found with session ID: ${id}`] });
+  process.exit(1);
+}
+const turn = (existsSync(file) ? Number(readFileSync(file, 'utf8')) : 0) + 1;
+writeFileSync(file, String(turn));
+writeFileSync(join(home, 'claude-args.json'), JSON.stringify(args));
+
+out({ type: 'system', subtype: 'init', session_id: id });
+out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }] } });
+const touch = /touch (\S+)/.exec(prompt)?.[1];
+if (touch) writeFileSync(touch, 'hi');
+setTimeout(() => {
+  if (prompt.includes('FAIL')) { out({ type: 'result', is_error: true, result: 'boom' }); process.exit(1); }
+  out({ type: 'result', is_error: false, session_id: id, result: `turn ${turn}: ${prompt}` });
+}, Number(/sleep (\d+)/.exec(prompt)?.[1] ?? 0));

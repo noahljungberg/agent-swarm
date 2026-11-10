@@ -3,7 +3,7 @@
 # ponytail: idempotent symlink, no-op if PATH dir or source is unavailable.
 set -euo pipefail
 root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-src="$root/skills/agent-swarm/scripts/agent-swarm"
+src="$root/skills/agent-swarm/src/cli.ts"
 [ -f "$src" ] || exit 0
 chmod +x "$src" 2>/dev/null || true
 mkdir -p "$HOME/.local/bin"

@@ -1,7 +1,7 @@
 {
   "name": "agent-swarm",
-  "version": "0.2.0",
-  "description": "Orchestration skill: make the current session a controller that spawns Codex/Claude/Hermes worker agents in tmux, tracks them in a TSV registry, tails logs, sends input, and reviews output.",
+  "version": "0.3.0",
+  "description": "Orchestration skill: make the current session a controller that hands tasks to persistent Codex/Claude worker agents, waits for their replies, and reviews and commits their work.",
   "author": {
     "name": "Noah Ljungberg",
     "url": "https://github.com/noahljungberg"
@@ -9,5 +9,5 @@
   "homepage": "https://github.com/noahljungberg/agent-swarm",
   "repository": "https://github.com/noahljungberg/agent-swarm",
   "license": "MIT",
-  "keywords": ["orchestration", "agents", "tmux", "codex", "claude"]
+  "keywords": ["orchestration", "agents", "codex", "claude"]
 }

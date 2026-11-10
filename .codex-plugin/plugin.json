@@ -1,7 +1,7 @@
 {
   "name": "agent-swarm",
-  "version": "0.2.0",
-  "description": "Orchestration skill: make the current session a controller that spawns Codex/Claude/Hermes worker agents in tmux, tracks them in a TSV registry, tails logs, sends input, and reviews output.",
+  "version": "0.3.0",
+  "description": "Orchestration skill: make the current session a controller that hands tasks to persistent Codex/Claude worker agents, waits for their replies, and reviews and commits their work.",
   "author": {
     "name": "Noah Ljungberg",
     "url": "https://github.com/noahljungberg"
@@ -9,18 +9,18 @@
   "homepage": "https://github.com/noahljungberg/agent-swarm",
   "repository": "https://github.com/noahljungberg/agent-swarm",
   "license": "MIT",
-  "keywords": ["orchestration", "agents", "tmux", "codex", "claude"],
+  "keywords": ["orchestration", "agents", "codex", "claude"],
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Swarm",
-    "shortDescription": "Spawn and track Codex/Claude/Hermes worker agents",
-    "longDescription": "Make the current session an orchestrator: split work into bounded worker prompts, spawn tmux-backed Codex/Claude/Hermes/shell workers, monitor logs, send follow-up input, and review results.",
+    "shortDescription": "Hand tasks to persistent Codex/Claude worker agents",
+    "longDescription": "Make the current session an orchestrator: split work into bounded tasks, hand them to persistent Codex and Claude workers that keep their context between tasks, wait for their replies, and review and commit their work.",
     "developerName": "Noah Ljungberg",
     "category": "Productivity",
     "capabilities": ["Instructions", "Lifecycle hooks"],
     "websiteURL": "https://github.com/noahljungberg/agent-swarm",
     "defaultPrompt": [
-      "Use agent-swarm. Act as the orchestrator: split the task into bounded worker prompts, spawn workers, monitor them, review outputs, and report running/completed/blocked agents plus required user action."
+      "Use agent-swarm. Act as the orchestrator: split the task into bounded worker prompts, hand them to workers with agent-swarm run, wait for them, review and commit their work, and report running/completed/blocked agents plus required user action."
     ]
   }
 }
