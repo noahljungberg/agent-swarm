@@ -3,7 +3,6 @@
 
 import { ENGINES } from './engines/index.ts';
 import { SessionLostError } from './engines/types.ts';
-import { git } from './git.ts';
 import * as store from './store.ts';
 
 // Sent with every turn, so the orchestrator's task can be just the task
@@ -14,11 +13,9 @@ const rules = (cwd: string) => `You are a worker agent. An orchestrator agent gi
 - If the task is ambiguous or you are blocked, stop and say exactly what you need instead of guessing.
 - End every reply with: what you changed, what you ran to verify it and the result, and any blockers or open questions.`;
 
-function endTurn(worker: store.Worker, turn: store.Turn, outcome: { ok: boolean; reply?: string; error?: string }): void {
-  let uncommitted = '';
-  try { uncommitted = git(worker.cwd, 'status', '--short'); } catch { /* cwd is not a repo */ }
-  store.saveTurn(worker.name, { ...turn, ...outcome, ended: new Date().toISOString(), uncommitted });
-  store.log(worker.name, outcome.ok ? `turn ${turn.n} done\n${outcome.reply}` : `turn ${turn.n} failed: ${outcome.error}`);
+function endTurn(name: string, turn: store.Turn, outcome: { ok: boolean; reply?: string; error?: string }): void {
+  store.saveTurn(name, { ...turn, ...outcome, ended: new Date().toISOString() });
+  store.log(name, outcome.ok ? `turn ${turn.n} done\n${outcome.reply}` : `turn ${turn.n} failed: ${outcome.error}`);
 }
 
 async function runTurn(name: string, task: string): Promise<void> {
@@ -39,9 +36,9 @@ async function runTurn(name: string, task: string): Promise<void> {
       lost = '(this worker\'s earlier conversation is gone, it started fresh without that context)\n';
       return attempt(null);
     });
-    endTurn(worker, turn, { ok: true, reply: lost + result.reply });
+    endTurn(name, turn, { ok: true, reply: lost + result.reply });
   } catch (err) {
-    endTurn(worker, turn, { ok: false, error: (err as Error).message });
+    endTurn(name, turn, { ok: false, error: (err as Error).message });
   }
 }
 
@@ -49,9 +46,8 @@ export async function work(name: string): Promise<void> {
   if (!store.lock(name)) return;  // another runner already has it
   // `stop` SIGTERMs our whole process group, so the engine and its tools die with us
   process.on('SIGTERM', () => {
-    const worker = store.loadWorker(name);
     const turn = store.loadTurn(name);
-    if (worker && turn && !turn.ended) endTurn(worker, turn, { ok: false, error: 'stopped' });
+    if (turn && !turn.ended) endTurn(name, turn, { ok: false, error: 'stopped' });
     store.unlock(name);
     process.exit(0);
   });

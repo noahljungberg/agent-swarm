@@ -46,8 +46,10 @@ function status(name: string): string {
   return turn ? turnState(turn) : 'idle';
 }
 
+const NAME = /^[a-z0-9][a-z0-9-]*$/;  // also keeps a name from walking out of the workers dir
+
 function existing(name: string | undefined): store.Worker {
-  return (name && store.loadWorker(name)) || fail(`no worker named ${name ?? '(missing name)'}. agent-swarm list shows them`);
+  return (name && NAME.test(name) && store.loadWorker(name)) || fail(`no worker named ${name ?? '(missing name)'}. agent-swarm list shows them`);
 }
 
 function startRunner(name: string): void {
@@ -79,7 +81,7 @@ function run(args: string[]): void {
     options: { engine: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, cwd: { type: 'string' }, worktree: { type: 'boolean' } },
   });
   const [name, ...words] = positionals;
-  if (!name || !/^[a-z0-9][a-z0-9-]*$/.test(name)) fail('run needs a worker name: lowercase letters, digits and dashes');
+  if (!name || !NAME.test(name)) fail('run needs a worker name: lowercase letters, digits and dashes');
   const task = (words.join(' ') || (process.stdin.isTTY ? '' : readFileSync(0, 'utf8'))).trim();
   if (!task) fail('no task. Pass it after -- or on stdin');
   const here = realpathSync(values.cwd ?? process.cwd());
@@ -106,20 +108,19 @@ function run(args: string[]): void {
 
 // --- wait ---
 
-function elapsed(turn: store.Turn): string {
-  const s = Math.round(((turn.ended ? Date.parse(turn.ended) : Date.now()) - Date.parse(turn.started)) / 1000);
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
-}
-
 function block(name: string, state: string, turn: store.Turn | null, body: string): string {
-  return `== ${name}: ${state}${turn ? `, turn ${turn.n}, ${elapsed(turn)}` : ''}\n${body}\n`;
+  if (!turn) return `== ${name}: ${state}\n${body}\n`;
+  const s = Math.round(((turn.ended ? Date.parse(turn.ended) : Date.now()) - Date.parse(turn.started)) / 1000);
+  return `== ${name}: ${state}, turn ${turn.n}, ${s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`}\n${body}\n`;
 }
 
-function uncommitted(name: string, turn: store.Turn): string {
-  const files = turn.uncommitted ? turn.uncommitted.split('\n') : [];
+// The worker's tree as it is right now, so a commit made since the turn is not listed
+function uncommitted(cwd: string): string {
+  let files: string[] = [];
+  try { files = git(cwd, 'status', '--short').split('\n').filter(Boolean); } catch { /* cwd is not a repo */ }
   if (!files.length) return '';
   const more = files.length > 30 ? `\n... and ${files.length - 30} more` : '';
-  return `\n\nuncommitted in ${store.loadWorker(name)!.cwd}:\n${files.slice(0, 30).join('\n')}${more}`;
+  return `\n\nuncommitted in ${cwd}:\n${files.slice(0, 30).join('\n')}${more}`;
 }
 
 // Every turn that finished since the last wait (or the last one again), then where the worker is now.
@@ -132,7 +133,7 @@ function report(name: string): { blocks: string[]; states: string[] } {
   const states: string[] = shown.map(turnState);
   const blocks = shown.map((turn, i) => {
     const last = i === shown.length - 1 && state !== 'busy';  // the tree is still changing while busy
-    return block(name, turnState(turn), turn, `${turn.ok ? turn.reply : turn.error}${last ? uncommitted(name, turn) : ''}`);
+    return block(name, turnState(turn), turn, `${turn.ok ? turn.reply : turn.error}${last ? uncommitted(store.loadWorker(name)!.cwd) : ''}`);
   });
   const current = store.loadTurn(name);
   const running = current && !current.ended ? current : null;
@@ -151,7 +152,9 @@ async function wait(args: string[]): Promise<void> {
     existing(name);
     if (store.queueLength(name)) startRunner(name);  // tasks left over from a crash or reboot
   }
-  const deadline = values.timeout ? Date.now() + Number(values.timeout) * 1000 : Infinity;
+  const seconds = values.timeout === undefined ? Infinity : Number(values.timeout);
+  if (!(seconds > 0)) fail('--timeout takes a number of seconds');
+  const deadline = Date.now() + seconds * 1000;
   while (names.some(busy) && Date.now() < deadline) await sleep(1000);
   const reports = names.map(report);
   const states = reports.flatMap((r) => r.states);

@@ -32,7 +32,6 @@ export interface Turn {
   ok?: boolean;
   reply?: string;
   error?: string;
-  uncommitted?: string;  // git status --short of the cwd when the turn ended
 }
 
 export const path = (name: string, file = '') => join(HOME, 'workers', name, file);

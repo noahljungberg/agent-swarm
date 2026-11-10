@@ -109,6 +109,14 @@ test('--worktree hires into its own worktree, wait lists what is uncommitted', (
   // from the main checkout the same name reaches the same worker
   swarm(['run', 'w', '--', 'more'], repo);
   assert.match(swarm(['wait', 'w']).stdout, /turn 2: more/);
+
+  // uncommitted is read live: once the orchestrator commits, wait stops listing it
+  execFileSync('git', ['add', '-A'], { cwd: tree });
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'made'], { cwd: tree });
+  assert.doesNotMatch(swarm(['wait', 'w']).stdout, /uncommitted/);
+
+  assert.equal(swarm(['wait', 'w', '--timeout', '10m']).status, 2);
+  assert.equal(swarm(['rm', '../..']).status, 2);
   assert.match(swarm(['rm', 'w']).stdout, /worktree stays at/);
   assert.ok(existsSync(tree));
 });
