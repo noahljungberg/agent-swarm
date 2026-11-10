@@ -1,11 +1,11 @@
 ---
 name: agent-swarm
-description: Generic orchestration workflow for making the current Claude Code/Codex session the controller, spawning separate Codex/Claude/Hermes worker agents in tmux, tracking their state, monitoring logs, sending follow-up input, and reviewing results. Not project-specific.
+description: Generic orchestration workflow for making the current Claude Code/Codex session the controller that hands tasks to persistent Codex/Claude worker agents, waits for their replies, and reviews and commits their work. Not project-specific.
 ---
 
 # Agent Swarm
 
-Use this skill when the user wants one agent to become an orchestrator/controller and spawn other agents to do bounded work.
+Use this skill when the user wants one agent to become an orchestrator/controller and have other agents do bounded work.
 
 Trigger phrases:
 
@@ -23,29 +23,73 @@ This is generic. Do not assume StohnTrade unless the user explicitly names that 
 
 ## Core model
 
-The current Claude Code or Codex session is the orchestrator — the senior
-developer. Workers are **persistent employees** — junior developers in live
-tmux sessions, hired once per conversation and reused for every follow-up
-task, tracked by the `agent-swarm` CLI. The cardinal sin of orchestration is
-spawning a fresh agent for work an existing employee already has context on.
+You are the orchestrator, the senior developer. Workers are **persistent
+employees**: each has a name and a saved conversation. You hire one by giving it
+its first task, and every later task to the same name continues that
+conversation, so it remembers what it built and why. The cardinal sin of
+orchestration is hiring a fresh agent for work an existing employee already has
+context on.
 
-State lives in:
+A worker is not a running process. Between tasks nothing is alive; the engine's
+saved session carries the context, so workers survive reboots.
 
-```text
-~/.agent-swarm/
-  agents.tsv        # registry of spawned workers
-  prompts/          # prompt files
-  runs/             # per-agent runner scripts
-  logs/             # persistent logs
-```
-
-Installed command:
+## The whole tool
 
 ```bash
-agent-swarm
+# Give a task. Hires `coder` if the name is new, otherwise continues its conversation
+agent-swarm run coder --worktree -- 'Add auth tests for src/auth.ts. Run npm test.'
+# A reviewer works inside the tree it reviews, so point it there
+agent-swarm run reviewer --engine claude --cwd ~/.agent-swarm/worktrees/repo-coder -- 'Review the uncommitted diff against docs/auth.md. Do not edit anything.'
+
+# Block until they finish. Prints every new reply and the files each worker left uncommitted
+agent-swarm wait
+
+# Follow up: same name, same conversation
+agent-swarm run coder -- 'Address the review: <findings>'
+agent-swarm wait coder
+
+agent-swarm list            # every worker and what it is doing right now
+agent-swarm log coder 60    # what coder did, step by step
+agent-swarm stop coder      # cut its current turn and drop its queued tasks
+agent-swarm rm coder        # stop it and forget it
 ```
 
-The CLI is intentionally small: tmux + prompt files + logs + a TSV registry. This gives us the good part of the old Hans/Heinrich/OpenClaw workflow — explicit process tracking and monitorability — without requiring a full SQLite daemon/cron system up front.
+- **`run` options apply when hiring** and stick for the worker's life:
+  `--engine codex|claude` (default codex), `--model ID`, `--effort LEVEL`,
+  `--cwd DIR` (default: here), `--worktree`.
+- **Defaults are the model policy.** Codex workers run `gpt-6-astra` at `xhigh`,
+  Claude workers run `claude-opus-5-5`. Pass `--model` only to escalate.
+- **Long tasks go on stdin:** `agent-swarm run coder <<'EOF' ... EOF`.
+- **A task for a busy worker queues** behind its current turn. You get one reply
+  back per task.
+- **To steer a worker mid-task,** `stop` it and `run` the correction. Its
+  conversation is kept, so it knows what it was doing.
+- **`wait` blocks.** Run it in the background if your harness supports that, so
+  you are woken when it exits. With no names it covers every worker of this
+  project that is busy or has a reply you have not seen. Exit code 0 = every
+  turn finished ok, 1 = one failed, was stopped or died, 124 = `--timeout S` hit.
+  On a timeout it prints only what is new, never an older reply.
+- **Names belong to a project** (a git repo and its worktrees). Call
+  `agent-swarm` from inside that project; the same name from another repo is
+  refused. Pick names that say the job: `auth-coder`, `api-reviewer`.
+
+`agent-swarm` needs to run outside any sandbox your own harness applies, since
+it starts worker processes and writes `~/.agent-swarm`.
+
+## Workers never commit
+
+Workers leave their changes uncommitted, and you review and commit them. Codex's
+sandbox cannot write `.git` at all, and the rule is the same for Claude workers
+so you never have to guess. After each `wait`:
+
+```bash
+git -C <worker cwd> diff            # read what it actually did
+git -C <worker cwd> add -A
+git -C <worker cwd> commit -m '<message in the repo's convention>'
+```
+
+Commit after every accepted turn. Uncommitted work in a worktree survives a
+reboot on disk, but a commit is what makes it safe.
 
 ## When to use
 
@@ -54,11 +98,11 @@ Use this for:
 - Parallel implementation tasks
 - Multi-repo or multi-module work
 - Independent research/review tasks
-- Long running code agents that need monitoring
+- Long running code agents
 - Reviewer/fixer loops
 - Any task where fresh context per worker is better than stuffing everything into the controller context
 
-Do not spawn workers for:
+Do not hire workers for:
 
 - Simple read-only questions
 - Tiny edits
@@ -70,199 +114,25 @@ Do not spawn workers for:
 
 Rankings, higher = better. Cost reflects actual paid cost in practice, not list price. Intelligence is how hard a problem you can hand the model unsupervised. Taste covers UI/UX, code quality, API design, and copy.
 
-| model (CLI id)    | engine | cost | intelligence | taste |
-|-------------------|--------|------|--------------|-------|
-| `gpt-6-astra`     | codex  | 9    | 8            | 5     |
-| `claude-opus-5-5` | claude | 4    | 7            | 8     |
-| `claude-fable-5-1`| claude | 2    | 9            | 9     |
+| model (CLI id)     | engine | cost | intelligence | taste |
+|--------------------|--------|------|--------------|-------|
+| `gpt-6-astra`      | codex  | 9    | 8            | 5     |
+| `claude-opus-5-5`  | claude | 4    | 7            | 8     |
+| `claude-fable-5-1` | claude | 2    | 9            | 9     |
 
-The two workhorses are `gpt-6-astra` (Codex) and `claude-opus-5-5` (Claude). Fable is the escalation path, not a default.
+The two workhorses are the engine defaults. Fable is the escalation path:
+`--engine claude --model claude-fable-5-1`.
 
-These are defaults, not limits. You have standing permission to override them: if a cheaper model's output does not meet the bar, rerun or redo with a smarter model without asking.
+These are defaults, not limits. You have standing permission to override them: if a cheaper model's output does not meet the bar, redo it with a smarter model without asking.
 Judge output quality, not price tags. Escalating is cheaper than shipping mediocre work.
 Cost is a tie-breaker only; when axes conflict for anything that ships: intelligence > taste > cost.
-Bulk/mechanical work (clear-spec implementation, data analysis, migrations): `gpt-6-astra`.
-Anything user-facing (UI, copy, API design) needs taste >= 7: `claude-opus-5-5`, or `claude-fable-5-1` when Opus falls short.
-Reviews of plans/implementations: `claude-opus-5-5` (or `claude-fable-5-1` for hard ones); optionally add `gpt-6-astra` as an extra independent perspective.
+Bulk/mechanical work (clear-spec implementation, data analysis, migrations): codex.
+Anything user-facing (UI, copy, API design) needs taste >= 7: claude, or Fable when Opus falls short.
+Reviews of plans/implementations: claude (Fable for hard ones); optionally add a codex worker as an extra independent perspective.
 Never use Haiku or Sonnet. Never use a previous generation (GPT-5.x, Opus 5, Fable 5): if the current model is unavailable, report the blocker instead of downgrading.
 
-## First command
-
-Always check the tool before using it:
-
-```bash
-agent-swarm doctor
-```
-
-## Basic commands
-
-```bash
-# Hire a persistent Codex employee (live TUI in tmux — the default for coders)
-agent-swarm spawn --name coder --engine codex --mode interactive --model gpt-6-astra --reasoning xhigh --cwd "$PWD" -- \
-  'Add missing auth tests. Follow AGENTS.md. Commit when done. Do not push.'
-
-# One-shot Claude worker in print mode (fire-and-forget tasks)
-agent-swarm spawn --name security-review --engine claude --model claude-opus-5-5 --cwd "$PWD" -- \
-  'Review this codebase for security issues. Write findings to SECURITY_REVIEW.md.'
-
-# List all tracked workers
-agent-swarm list
-
-# Show one worker metadata
-agent-swarm status coder
-
-# Read a worker (live TUI pane for interactive workers, log tail for exec)
-agent-swarm log coder 120
-
-# Is an interactive employee mid-task? ("busy" rc=0 / "idle" rc=1 / "blocked" rc=3)
-agent-swarm busy coder
-
-# Steer a live worker — queued behind the current turn if it is busy
-agent-swarm send coder 'Use option B and continue.'
-
-# Hard-steer: cut the current turn (Esc), then send the correction
-agent-swarm interrupt coder
-agent-swarm send coder 'Stop — wrong file. Edit src/auth.ts instead.'
-
-# Give an employee its next task, keeping its prior context
-agent-swarm assign coder -- 'Address the review comments and re-run the tests.'
-
-# Block until workers are done (exec: exited; interactive: idle at composer)
-agent-swarm wait coder security-review --timeout 1800
-
-# Stop a worker (sends it home; keeps its registry row + conversation id)
-agent-swarm stop coder
-
-# Remove from registry (forgets it)
-agent-swarm rm coder
-```
-
-## Persistent employees — the default operating model
-
-A worker is an employee, not a one-shot job. Hire once per conversation, then
-`assign` every follow-up to the same employee. It keeps the full context of
-what it built and why, and its conversation prefix stays warm in the provider's
-prompt cache — a fresh agent pays for re-reading the repo and re-deriving
-context every time.
-
-**Hire coders as `--mode interactive`.** The engine's TUI stays alive in tmux
-between tasks: follow-ups are typed straight in (no relaunch), you can steer it
-mid-task, and `wait` returns when it goes idle. Use plain exec mode only for
-fire-and-forget one-shots you will never follow up on.
-
-**Reuse rule — check before every spawn.** Run `agent-swarm list` first. If an
-employee's cwd/mission overlaps the new task, `assign` it instead of spawning.
-Spawn a new employee only when:
-
-- the task is in a different repo/worktree than every existing employee, or
-- you need parallelism an existing employee can't give, or
-- the employee's conversation has grown so large it is degrading — then
-  recycle (`rm` + `spawn`) and say so.
-
-Lifecycle:
-
-- `spawn` hires an employee and gives it a stable conversation id.
-- `assign <name> -- '<task>'` gives it new work. If it's a live interactive
-  session, the task is typed in; otherwise the employee is relaunched
-  **resuming its prior conversation** (Claude `--resume`, Codex `resume` /
-  `exec resume`) in the same cwd, so it remembers its earlier work — this
-  survives reboots and killed tmux sessions.
-- `stop` sends it home but keeps its row and conversation id.
-- `rm` fires it and forgets the conversation.
-
-Steering a live employee mid-task:
-
-- `send <name> '<msg>'` — types into the TUI; if the employee is mid-turn the
-  message queues and is handled next.
-- `interrupt <name>` — sends Esc to cut the current turn, for when it is going
-  down the wrong path; follow with `send` to redirect.
-
-A long-lived employee's context grows per task. Keep one employee to one
-cwd/branch, and recycle it (`rm` + `spawn`) when its conversation gets large or
-its work is unrelated.
-
-## Engines
-
-### Codex worker, default
-
-Explicitly pin every Codex worker to `gpt-6-astra` with `--reasoning xhigh`.
-Do not resume a worker pinned to an older model (`agent-swarm status` shows the
-command); `rm` it and spawn a fresh `gpt-6-astra` worker.
-
-```bash
-# persistent employee (default for implementation work)
-agent-swarm spawn --engine codex --mode interactive --model gpt-6-astra --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
-
-# fire-and-forget one-shot
-agent-swarm spawn --engine codex --model gpt-6-astra --reasoning xhigh --name <name> --cwd <dir> -- '<prompt>'
-```
-
-Commands inside tmux: interactive runs
-`codex --no-alt-screen -c sandbox_mode=workspace-write -c approval_policy=never
--m gpt-6-astra -c model_reasoning_effort=xhigh '<prompt>'` (the TUI stays open
-between tasks; the runner pre-trusts the cwd so fresh worktrees don't block on
-the trust dialog); exec runs `codex exec` with the same flags. Resumes
-(`codex resume` / `codex exec resume`) reuse them, so a recalled employee keeps
-its model and sandbox. The policy is passed via `-c` because Codex dropped
-`--full-auto` and `exec resume` accepts neither `-s` nor `-a`.
-
-Use Codex for implementation workers by default.
-Codex requires a git repo.
-
-Options:
-
-```bash
---no-full-auto         # drop the workspace-write sandbox + never-ask policy (Codex defaults)
---yolo                 # --dangerously-bypass-approvals-and-sandbox; only if user explicitly asks
---model gpt-6-astra    # reused when the worker is resumed
---reasoning xhigh      # model_reasoning_effort
-```
-
-### Claude worker
-
-Explicitly pin every Claude worker to `claude-opus-5-5` (or `claude-fable-5-1`
-when escalating). Do not resume a worker pinned to an older model; `rm` it and
-spawn a fresh one.
-
-```bash
-agent-swarm spawn --engine claude --model claude-opus-5-5 --name <name> --cwd <dir> -- '<prompt>'
-```
-
-Default command inside tmux:
-
-```bash
-claude -p --session-id <uuid> --permission-mode auto --model claude-opus-5-5 --max-turns 30 '<prompt>'
-```
-
-`--permission-mode auto` is the default because plain `claude -p` declines file
-writes, so a reviewer told to write a report would silently fail. `--reasoning
-<level>` maps to Claude's `--effort` (low|medium|high|xhigh|max). `--dangerous`
-swaps in `--dangerously-skip-permissions`; only if the user explicitly asks.
-
-Use Claude for reviews, planning, architecture, and analysis-heavy tasks.
-Use `--mode interactive` only if a multi-turn TUI session is necessary.
-
-### Hermes worker
-
-```bash
-agent-swarm spawn --engine hermes --name <name> --cwd <dir> -- '<prompt>'
-```
-
-Default command:
-
-```bash
-hermes chat -q '<prompt>'
-```
-
-Use Hermes workers when the worker needs Hermes-specific tools/skills/memory, not just coding.
-
-### Shell worker
-
-```bash
-agent-swarm spawn --engine shell --name tests --cwd <dir> --cmd 'npm test' -- 'run tests'
-```
-
-Use this to track long shell commands alongside agent workers.
+A worker's model is fixed when it is hired. To change it, `rm` the worker and
+hire again.
 
 ## Orchestration workflow
 
@@ -283,163 +153,101 @@ Bad splits:
 
 ### 2. Propose the roster, then hire
 
-First check for employees you already have: `agent-swarm list`. Reuse any whose
-cwd/mission fits (`assign`), and only roster what's missing.
+First check who you already have: `agent-swarm list`. Reuse any worker whose
+project and mission fit, and only roster what's missing.
 
 Before hiring, tell the user who you plan to employ and why:
 
 ```text
 Roster:
-1. name: coder
-   engine: codex (interactive — persistent employee)
-   cwd: /path/to/worktree
+1. name: auth-coder
+   engine: codex, own worktree
    mission: implement the API tests; will also handle review fixes later
-   acceptance: tests pass; local commit created
+   acceptance: tests pass
 
-2. name: reviewer
-   engine: claude (exec one-shot per review)
-   mission: review coder's diff against the spec
-   dependency: coder idle
+2. name: auth-reviewer
+   engine: claude
+   mission: review auth-coder's diff against the spec
+   dependency: auth-coder finished
 ```
 
 Once the user agrees, that roster IS the team for the rest of the
-conversation. Five turns later, a new implementation task goes to `coder` via
-`assign` — not to a new spawn.
+conversation. Five turns later, a new implementation task goes to `auth-coder`
+with `run`, not to a new name. Hire a new worker only when the task is in a
+different repo, you need parallelism the team can't give, or a worker's
+conversation has grown so large it is degrading (then `rm` it, hire it again
+under the same name, and say so).
 
-### 3. Use isolated worktrees for code changes
+Keep at most 4 workers busy at once unless the user overrides.
 
-For code-changing workers, prefer one git worktree per worker.
+### 3. Use `--worktree` for code-changing workers
 
-**NEVER put a worktree (or any worker working files) under `/tmp`.** `/tmp` is
-volatile — it is wiped on reboot/crash and on session teardown. A worker mid-build
-with uncommitted edits there loses everything when the box restarts (this has
-already cost a 36-minute run). Use a persistent location like
-`$HOME/agent-worktrees/<task-slug>`. Worktree commits live in the main
-repo's shared `.git`, so committed work survives even if the worktree dir is
-later removed — but only if it was committed. Pair this with the commit-first
-rule below.
+`--worktree` gives the worker its own git worktree at
+`~/.agent-swarm/worktrees/<repo>-<name>` on a new branch `agent/<name>`, cut from
+your current HEAD. Use it whenever more than one worker changes code, so they
+never share a working tree. It only works when hiring: an existing worker
+without a worktree refuses the flag. Uncommitted changes in your own checkout are not in
+the worktree, and `run` says so when that applies; if the main tree is dirty, do
+not hire from it unless the user approves.
+
+After you merge the branch, clean up:
 
 ```bash
-ROOT=/path/to/repo
-BASE=main
-BRANCH=agent/<task-slug>
-WORKTREE="$HOME/agent-worktrees/<task-slug>"   # persistent — never /tmp
-
-cd "$ROOT"
-git fetch --all --prune
-git status --short
-mkdir -p "$(dirname "$WORKTREE")"
-git worktree add -b "$BRANCH" "$WORKTREE" "$BASE"
+git worktree remove ~/.agent-swarm/worktrees/<repo>-<name>
+git branch -d agent/<name>
 ```
 
-After merging a worker's branch, clean up with
-`git worktree remove "$WORKTREE"` so the home directory doesn't accumulate
-stale checkouts.
+`rm` forgets the worker but leaves its worktree and branch alone. Hire the same
+name again with `--worktree` and it gets that worktree back, with a fresh
+conversation. That is how you replace a worker whose conversation has degraded
+without losing its work.
 
-If the main working tree is dirty, do not spawn a worker from it unless the user explicitly approves.
+### 4. Write the task
 
-**Durability for slow builds.** A worker that sits on a multi-minute build with
-uncommitted work loses it if the box restarts. Two ways to be safe, in order of
-preference:
-- **Persistent worktree (always do this):** under `$HOME/...`, the worker's
-  uncommitted edits survive teardown on disk, so the orchestrator can commit
-  them at review time even if the worker never did.
-- **Commit-first (when the worker CAN commit):** have the worker commit each
-  item before building, build as post-commit verification (amend on fix). BUT
-  note a Codex sandbox often CANNOT commit inside a git worktree — the worktree's
-  gitdir lives at `<mainrepo>/.git/worktrees/<name>`, outside the sandbox-writable
-  cwd, so `git commit` fails EROFS. When that happens, don't fight it: tell the
-  worker NOT to commit/stash/reset, and have the orchestrator commit frequently
-  from its own non-sandboxed shell. The persistent location (not worker commits)
-  is what actually guarantees durability.
+Every worker already gets these standing rules with each turn, so do not repeat
+them: work only in its directory, read AGENTS.md / CLAUDE.md first, never commit,
+push, merge or deploy, stop and ask when blocked, and end each reply with what
+changed, what was run to verify it, and open questions.
 
-### 4. Write self-contained worker prompts
-
-Every worker prompt must include:
+Your task adds what only you know:
 
 ```text
-You are a worker under an orchestrator.
-Working directory: <absolute path>
 Mission: <bounded task>
-Scope limits:
-- Work only in this directory/repo.
-- Do not touch production.
-- Do not merge or deploy.
-- Commit locally when done, but do not push unless explicitly instructed.
-Mandatory context:
-- Read AGENTS.md / CLAUDE.md / repo docs first if present.
+Context: <files, docs, decisions it must read or respect>
 Acceptance criteria:
 - <clear checks>
 Verification:
 - <commands to run>
-Output expected:
-- changed files
-- commits
-- verification results
-- blockers/questions
 ```
 
-Keep prompts specific. A bad worker prompt creates chaos.
+Keep tasks specific. A vague task creates chaos. No secrets in tasks.
 
-### 5. Spawn workers
-
-Use `agent-swarm spawn`, not raw tmux, unless the script is missing.
+### 5. Wait, then review before reporting success
 
 ```bash
-agent-swarm spawn --name <name> --engine codex --mode interactive --model gpt-6-astra --reasoning xhigh --cwd <worktree> -- '<prompt>'
+agent-swarm wait
+git -C <worker cwd> diff
 ```
 
-For many workers, spawn at most 4 concurrently unless the user overrides.
+Read the reply, then read the diff: the reply is the worker's claim, the diff is
+the fact. Check that it really ran the verification it reports; if not, run it
+yourself or send it back. If a worker asks a question and the answer is obvious,
+answer with `run`. If the answer changes scope or risk, ask the user.
 
-### 6. Monitor
+A turn that reports `failed` says why (quota, crash, sandbox). `died` means the
+worker process itself was killed; `run` it again and it resumes. A worker blocked
+by its sandbox or permissions has no bypass flag: do that step yourself or ask
+the user.
 
-```bash
-agent-swarm list
-agent-swarm status <name>
-agent-swarm log <name> 120
-```
+### 6. Reviewer/fixer loop
 
-If a worker appears stuck, inspect its log before killing it.
-If it asks a question and the answer is obvious, send it:
+For serious code changes:
 
-```bash
-agent-swarm send <name> '<answer>'
-```
-
-If the question changes scope or risk, ask the user.
-
-`busy`/`wait` report `blocked` when an interactive TUI is parked on a modal
-(for example Codex's "Hooks need review" prompt after hooks change, or an
-approval dialog). Read it with `agent-swarm log <name>` and ask the user. Never
-trust hooks or approve on the user's behalf.
-
-### 7. Review outputs before reporting success
-
-After a worker exits:
-
-```bash
-agent-swarm status <name>
-agent-swarm log <name> 160
-git -C <worktree> status --short
-git -C <worktree> log --oneline -5
-git -C <worktree> diff --stat <base>...HEAD
-git -C <worktree> diff <base>...HEAD
-```
-
-Then verify the worker actually ran the promised checks.
-If not, run them or spawn a fix worker.
-
-### 8. Reviewer/fixer loop
-
-For serious code changes, use this loop:
-
-1. Implementer worker does the task and commits.
-2. Reviewer worker reviews the diff against the original spec.
-3. If changes required, steer the implementer if still alive; otherwise spawn a fix worker on the same branch/worktree.
+1. The implementer does the task. You commit what you accept.
+2. The reviewer reviews the diff against the original spec.
+3. If changes are required, `run` them on the implementer. It still has its context.
 4. Repeat until approved.
 5. Only then report ready to the user.
-
-This is the old workflow's best idea: separate implementation from review.
 
 ## Final report format
 
@@ -447,8 +255,7 @@ Report back in this shape:
 
 ```text
 Agent swarm result:
-- Workers spawned: <N>
-- Running: <names>
+- Workers: <names, and who is still busy>
 - Completed: <names>
 - Failed/blocked: <names + reason>
 - Branches/worktrees: <list>
@@ -459,24 +266,29 @@ Agent swarm result:
 
 ## Safety rules
 
-- No secrets in prompts.
+- No secrets in tasks.
 - No production changes unless explicitly requested.
 - No auto-merge unless explicitly requested.
 - No overlapping file edits across concurrent workers.
-- Keep worker count reasonable; default max 4.
-- Prefer worktrees for code-changing workers.
-- NEVER place worktrees or worker files under `/tmp` — it is wiped on crash/reboot/teardown and loses uncommitted work. Use `$HOME/agent-worktrees/...`.
-- Tell workers to commit each item before any long build, so a teardown can't eat uncommitted work.
-- The orchestrator owns review and integration; workers do bounded tasks.
+- At most 4 busy workers by default.
+- Worktrees for code-changing workers. Never put worker files under `/tmp`: it is wiped on reboot.
+- The orchestrator owns review, commits and integration; workers do bounded tasks.
+
+## How workers run
+
+- **Codex:** one `codex app-server` per turn, `workspace-write` sandbox, never
+  asks for approval. It can edit its directory and run commands there; it cannot
+  write `.git`, and it has network access only if the user's Codex config grants it.
+- **Claude:** one `claude -p` per turn with `--permission-mode auto`.
 
 ## If `agent-swarm` is missing
 
-When installed as a plugin, a SessionStart hook symlinks the bundled CLI
-(`skills/agent-swarm/scripts/agent-swarm`) to `~/.local/bin/agent-swarm`, so the
-bare `agent-swarm` commands in this skill just work — provided `~/.local/bin` is
-on your `PATH`.
+It needs Node 22.18 or newer, plus `codex` and/or `claude` on PATH.
 
-If the command is still not found:
+When installed as a plugin, a SessionStart hook symlinks the CLI
+(`skills/agent-swarm/src/cli.ts`) to `~/.local/bin/agent-swarm`, so the bare
+`agent-swarm` commands in this skill just work, provided `~/.local/bin` is on
+your `PATH`. If the command is still not found:
 
 ```bash
 # plugin install: re-run the bundled linker
@@ -486,4 +298,4 @@ bash "${CLAUDE_PLUGIN_ROOT}/hooks/install-path.sh"
 ./install.sh
 ```
 
-Then check with `agent-swarm doctor`.
+Then check with `agent-swarm help`.

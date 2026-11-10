@@ -5,8 +5,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 SKILL="$REPO/skills/agent-swarm"
 mkdir -p ~/.local/bin ~/.codex/skills ~/.claude/skills
-chmod +x "$SKILL/scripts/agent-swarm"
-ln -sfn "$SKILL/scripts/agent-swarm" ~/.local/bin/agent-swarm
+chmod +x "$SKILL/src/cli.ts"
+ln -sfn "$SKILL/src/cli.ts" ~/.local/bin/agent-swarm
 ln -sfn "$SKILL" ~/.codex/skills/agent-swarm
 ln -sfn "$SKILL" ~/.claude/skills/agent-swarm
-echo "installed. ensure ~/.local/bin is on PATH, then run: agent-swarm doctor"
+echo "installed. ensure ~/.local/bin is on PATH, then run: agent-swarm help"
